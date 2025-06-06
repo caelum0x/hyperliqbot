@@ -1,0 +1,27 @@
+{
+  "telegram": {
+    "bot_token": "7918996154:AAGt5S3EvG1B-dC-8fiy-eJr-c5HiMyFoME",
+    "instructions": "Bot created! Username: @hyperliqubot - Keep this token secure!"
+  },
+  "base_url": "https://api.hyperliquid-testnet.xyz",
+  "referral_code": "HYPERBOT",
+  "hyperevm": {
+    "network": "testnet",
+    "rpc_url": "https://api.hyperliquid-testnet-evm.xyz/rpc"
+  },
+  "trading": {
+    "max_position_size": 10000,
+    "default_slippage": 0.005,
+    "risk_level": "medium"
+  },
+  "vault": {
+    "minimum_deposit": 100,
+    "profit_share": 0.1,
+    "lockup_days": 1
+  },
+  "ai": {
+    "model_retrain_hours": 24,
+    "confidence_threshold": 0.7,
+    "max_signals_per_hour": 10
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "telegram_token": "YOUR_TELEGRAM_BOT_TOKEN",
+  "base_url": "https://api.hyperliquid-testnet.xyz",
+  "referral_code": "ALPHABOT",
+  "vault_address": "0x1234567890abcdef1234567890abcdef12345678",
+  "mainnet": false,
+  
+  "strategies": {
+    "volume_farming": {
+      "enabled": true,
+      "daily_volume_target": 50000,
+      "max_leverage": 50
+    },
+    "rebate_mining": {
+      "enabled": true,
+      "target_maker_percentage": 3.0,
+      "min_spread": 0.0002
+    },
+    "competition_mode": {
+      "enabled": true,
+      "aggressive_volume": true,
+      "max_risk": 0.1
+    },
+    "hyperevm_farming": {
+      "enabled": true,
+      "monitor_protocols": true,
+      "auto_participate": true
+    },
+    "seedify_farming": {
+      "enabled": true,
+      "min_roi": 1.5,
+      "max_allocation": 1000
+    },
+    "nft_sniping": {
+      "enabled": true,
+      "min_profit_multiplier": 2.0,
+      "gas_multiplier": 1.5
+    }
+  },
+  
+  "risk_management": {
+    "max_position_size": 10000,
+    "stop_loss_pct": 0.02,
+    "take_profit_pct": 0.05,
+    "daily_loss_limit": 500
+  },
+  
+  "notifications": {
+    "discord_webhook": "",
+    "telegram_alerts": true,
+    "email_alerts": false
+  }
+}
