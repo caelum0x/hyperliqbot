@@ -1,11 +1,22 @@
 import json
 import os
+import sys
 
 import eth_account
 from eth_account.signers.local import LocalAccount
 
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
+
+# Import the actual example_utils from examples folder
+examples_dir = os.path.join(os.path.dirname(__file__), '..', 'examples')
+sys.path.append(examples_dir)
+
+# Import the real example_utils
+from example_utils import *
+
+# Re-export everything for backward compatibility
+__all__ = ['setup', 'setup_multi_sig_wallets']
 
 
 def setup(base_url=None, skip_ws=False, perp_dexs=None):

@@ -984,14 +984,16 @@ Use /vault to manage your vault positions.
                 return {'success': False, 'error': f'Coin {coin} not found'}
                 
             mid_price = float(all_mids[coin])
-            logger.info(f"Starting grid for {coin} at ${mid_price:.4f}")
             
             # Cancel existing orders for this coin
             open_orders = self.info.open_orders(self.address)
             for order in open_orders:
                 if order['coin'] == coin:
-                    self.exchange.cancel(coin, order['oid'])
-                    logger.info(f"Cancelled existing order: {order['oid']}")
+                    try:
+                        self.exchange.cancel(coin, order['oid'])
+                        logger.info(f"Cancelled existing order: {order['oid']}")
+                    except Exception as e:
+                        logger.error(f"Failed to cancel order {order['oid']}: {e}")
                     
             # Get available balance
             user_state = self.info.user_state(self.address)
@@ -1019,9 +1021,7 @@ Use /vault to manage your vault positions.
                 price_precision = 4
                 
             order_size = round(order_size, size_precision)
-            
             placed_orders = []
-            total_value = 0
             
             # Place buy orders below current price
             for i in range(1, levels + 1):
@@ -1040,8 +1040,6 @@ Use /vault to manage your vault positions.
                     
                     if order_result['status'] == 'ok':
                         placed_orders.append(('buy', buy_price, order_size))
-                        total_value += order_size * buy_price
-                        logger.info(f"Placed buy order: {coin} {order_size}@${buy_price}")
                         
                         # Record in database
                         await bot_db.record_trade(
@@ -1055,7 +1053,7 @@ Use /vault to manage your vault positions.
                         )
                 except Exception as e:
                     logger.error(f"Failed to place buy order {i}: {e}")
-                    
+            
             # Place sell orders above current price
             for i in range(1, levels + 1):
                 sell_price = mid_price * (1 + spacing * i)
@@ -1073,8 +1071,6 @@ Use /vault to manage your vault positions.
                     
                     if order_result['status'] == 'ok':
                         placed_orders.append(('sell', sell_price, order_size))
-                        total_value += order_size * sell_price
-                        logger.info(f"Placed sell order: {coin} {order_size}@${sell_price}")
                         
                         # Record in database
                         await bot_db.record_trade(
@@ -1095,17 +1091,16 @@ Use /vault to manage your vault positions.
                 'levels': levels,
                 'spacing': spacing,
                 'orders': placed_orders,
-                'started_at': datetime.now(),
-                'total_value': total_value
+                'started_at': datetime.now()
             }
             
-            logger.info(f"Grid completed: {len(placed_orders)} orders, ${total_value:.2f} total value")
+            logger.info(f"Grid completed: {len(placed_orders)} orders placed, ${sum([o[1] for o in placed_orders]):,.2f} total value")
             
             return {
                 'success': True,
                 'orders_placed': len(placed_orders),
-                'total_value': total_value,
-                'mid_price': mid_price
+                'mid_price': mid_price,
+                'vault_address': self.vault_address
             }
             
         except Exception as e:
@@ -1123,30 +1118,67 @@ Use /vault to manage your vault positions.
                 await update.message.reply_text("📊 No trading history found")
                 return
                 
+            # Initialize comprehensive stats
             total_volume = 0
             total_fees = 0
             total_rebates = 0
             maker_volume = 0
+            taker_volume = 0
+            total_pnl = 0
+            winning_trades = 0
+            losing_trades = 0
+            recent_fills = []
+            
+            # Calculate 24h cutoff
+            now = datetime.now()
+            cutoff_24h = (now - timedelta(hours=24)).timestamp() * 1000
             
             for fill in fills:
                 px = float(fill['px'])
                 sz = float(fill['sz'])
                 fee = float(fill.get('fee', 0))
+                fill_time = fill.get('time', 0)
                 
                 volume = px * sz
                 total_volume += volume
                 
-                if fee < 0:  # Negative fee = rebate earned
+                # Check if within 24h
+                if fill_time > cutoff_24h:
+                    recent_fills.append(fill)
+                
+                # Track maker vs taker
+                if fee < 0:  # Negative fee = rebate earned (maker)
                     total_rebates += abs(fee)
                     maker_volume += volume
-                else:
+                else:  # Positive fee = fee paid (taker)
                     total_fees += fee
+                    taker_volume += volume
+                
+                # Track PnL if available
+                if 'closedPnl' in fill:
+                    pnl = float(fill['closedPnl'])
+                    total_pnl += pnl
+                    if pnl > 0:
+                        winning_trades += 1
+                    else:
+                        losing_trades += 1
                     
-            # Calculate maker percentage
+            # Calculate derived metrics
             maker_pct = (maker_volume / total_volume * 100) if total_volume > 0 else 0
+            win_rate = (winning_trades / (winning_trades + losing_trades) * 100) if (winning_trades + losing_trades) > 0 else 0
+            avg_trade_size = total_volume / len(fills) if fills else 0
+            net_fees = total_rebates - total_fees
             
-            # Get database stats
-            vault_stats = await bot_db.get_vault_stats()
+            # Calculate 24h stats
+            daily_volume = sum(float(f['px']) * float(f['sz']) for f in recent_fills)
+            daily_trades = len(recent_fills)
+            daily_rebates = sum(abs(float(f.get('fee', 0))) for f in recent_fills if float(f.get('fee', 0)) < 0)
+            
+            # Get database stats for additional metrics
+            try:
+                db_stats = await bot_db.get_trading_stats(self.address)
+            except:
+                db_stats = {}
             
             # Get current account value
             user_state = self.info.user_state(self.address)
@@ -1155,48 +1187,65 @@ Use /vault to manage your vault positions.
             msg = f"""
 📊 **Live Trading Statistics**
 
-**Account Performance:**
+**Account Overview:**
 • Account Value: ${account_value:,.2f}
-• Total Volume: ${total_volume:,.2f}
-• Total Trades: {len(fills)}
+• Total P&L: ${total_pnl:+,.2f}
+• Win Rate: {win_rate:.1f}%
 
-**Fee Optimization:**
-• Maker Trades: {maker_pct:.1f}%
+**Trading Volume:**
+• All-Time Volume: ${total_volume:,.2f}
+• Total Trades: {len(fills):,}
+• Avg Trade Size: ${avg_trade_size:,.2f}
+• 24h Volume: ${daily_volume:,.2f}
+• 24h Trades: {daily_trades}
+
+**Fee Performance:**
+• Maker Volume: {maker_pct:.1f}%
 • Rebates Earned: ${total_rebates:.4f}
 • Fees Paid: ${total_fees:.4f}
-• Net Savings: ${total_rebates - total_fees:+.4f}
+• Net Savings: ${net_fees:+.4f}
+• 24h Rebates: ${daily_rebates:.4f}
 
-**Active Strategies:**
-• Grid Trading: {len(self.active_grids)} active
-• Vault Deposits: ${vault_stats.get('total_deposits', 0):,.2f}
-• Daily Volume: ${vault_stats.get('daily_volume', 0):,.2f}
-
-**Grid Details:**
+**Grid Trading Status:**
+• Active Grids: {len(self.active_grids)}
 """
             
-            # Add active grids
-            for coin, grid in self.active_grids.items():
-                runtime = (datetime.now() - grid['started_at']).total_seconds() / 3600
-                msg += f"\n{coin}: {len(grid['orders'])} orders, {runtime:.1f}h active"
-                msg += f"\n  Value: ${grid['total_value']:,.2f}, Mid: ${grid['mid_price']:,.2f}"
-                
-            # Calculate rebate tier info
-            volume_14d = total_volume  # Simplified - would need date filtering
-            if maker_pct > 3.0:
-                rebate_info = "Tier 3: -0.003% rebate ✅"
-            elif maker_pct > 1.5:
-                rebate_info = "Tier 2: -0.002% rebate ✅"
-            elif maker_pct > 0.5:
-                rebate_info = "Tier 1: -0.001% rebate ✅"
+            # Add active grids details
+            if self.active_grids:
+                msg += "\n**Active Grid Details:**"
+                for coin, grid in self.active_grids.items():
+                    runtime = (datetime.now() - grid['started_at']).total_seconds() / 3600
+                    success_rate = len(grid['orders']) / (len(grid['orders']) + len(grid.get('failed_orders', []))) * 100
+                    msg += f"\n• {coin}: {len(grid['orders'])} orders ({success_rate:.0f}% success)"
+                    msg += f"\n  Runtime: {runtime:.1f}h | Value: ${grid['total_value']:,.2f}"
+                    msg += f"\n  Mid: ${grid['mid_price']:,.2f} | Spread: {grid['spacing']*100:.1f}%"
+            
+            # Determine current rebate tier
+            if maker_pct >= 5.0:
+                rebate_tier = "Tier 4: -0.005% rebate 🏆"
+            elif maker_pct >= 3.0:
+                rebate_tier = "Tier 3: -0.003% rebate ✅"
+            elif maker_pct >= 1.5:
+                rebate_tier = "Tier 2: -0.002% rebate ✅"
+            elif maker_pct >= 0.5:
+                rebate_tier = "Tier 1: -0.001% rebate ✅"
             else:
-                rebate_info = "No rebate tier"
+                rebate_tier = "No rebate tier (need >0.5% maker)"
                 
-            msg += f"\n\n**Current Rebate Status:**\n{rebate_info}"
+            msg += f"\n\n**Rebate Status:** {rebate_tier}"
+            
+            # Add performance insights
+            if maker_pct < 80:
+                msg += f"\n\n💡 **Tip:** Increase maker percentage to earn more rebates!"
+            if daily_volume > 0:
+                projected_monthly = daily_volume * 30
+                msg += f"\n📈 **Projected Monthly Volume:** ${projected_monthly:,.0f}"
             
             keyboard = [
                 [InlineKeyboardButton("🔄 Refresh", callback_data="stats")],
                 [InlineKeyboardButton("📋 View Orders", callback_data="orders")],
-                [InlineKeyboardButton("💰 Check Balance", callback_data="balance")]
+                [InlineKeyboardButton("💰 Check Balance", callback_data="balance")],
+                [InlineKeyboardButton("🎯 Optimize Strategy", callback_data="optimize")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -1206,89 +1255,177 @@ Use /vault to manage your vault positions.
             logger.error(f"Stats command error: {e}")
             await update.message.reply_text(f"❌ Error fetching stats: {str(e)}")
     
-    async def deposit_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle vault deposits"""
-        user_id = update.effective_user.id
-        
-        msg = f"""
-🏦 **Vault Deposit System**
-
-**Deposit to Professional Trading Vault:**
-• Minimum: ${self.min_deposit} USDC
-• Performance Fee: {config.get_performance_fee()*100}% (only on profits)
-• Strategies: Grid Trading, Maker Rebate Mining, HLP Staking
-
-**Vault Address:**
-```
-{self.vault_address}
-```
-
-**Steps:**
-1. Send USDC to vault address above
-2. Use `/confirm <amount> <tx_hash>` to register deposit
-3. Start earning immediately!
-
-**Current Vault Stats:**
-• TVL: ${await self._get_vault_tvl():,.2f}
-• Daily Return: ~0.15%
-• Maker Rebates: Active
-
-Ready to deposit?
-        """
-        
-        keyboard = [
-            [InlineKeyboardButton("📋 Copy Address", callback_data="copy_vault")],
-            [InlineKeyboardButton("💡 Deposit Guide", callback_data="deposit_guide")],
-            [InlineKeyboardButton("📊 Vault Performance", callback_data="vault_performance")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(msg, parse_mode='Markdown', reply_markup=reply_markup)
+    async def run_grid_maintenance(self):
+        """Maintain and rebalance active grids"""
+        while True:
+            try:
+                for coin, grid in list(self.active_grids.items()):
+                    try:
+                        # Check if grid needs rebalancing
+                        current_price = float(self.info.all_mids().get(coin, 0))
+                        if current_price == 0:
+                            continue
+                            
+                        grid_mid = grid['mid_price']
+                        price_change = abs(current_price - grid_mid) / grid_mid
+                        
+                        # Rebalance if price moved >5%
+                        if price_change > 0.05:
+                            logger.info(f"Rebalancing {coin} grid: price changed {price_change:.1%}")
+                            
+                            # Cancel existing orders
+                            open_orders = self.info.open_orders(self.address)
+                            for order in open_orders:
+                                if order['coin'] == coin:
+                                    try:
+                                        self.exchange.cancel(coin, order['oid'])
+                                    except Exception as e:
+                                        logger.error(f"Failed to cancel {order['oid']}: {e}")
+                            
+                            # Restart grid with new price
+                            result = await self.start_grid_trading(
+                                coin, 
+                                grid['levels'], 
+                                grid['spacing']
+                            )
+                            
+                            if result['success']:
+                                logger.info(f"Successfully rebalanced {coin} grid")
+                            else:
+                                logger.error(f"Failed to rebalance {coin} grid: {result.get('error')}")
+                                
+                    except Exception as e:
+                        logger.error(f"Grid maintenance error for {coin}: {e}")
+                
+                # Sleep for 10 minutes between checks
+                await asyncio.sleep(600)
+                
+            except Exception as e:
+                logger.error(f"Grid maintenance loop error: {e}")
+                await asyncio.sleep(300)  # 5 minutes on error
     
-    async def confirm_deposit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Confirm user deposit"""
+    async def withdraw_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle vault withdrawals with proper validation"""
+        if not self.vault_address:
+            await update.message.reply_text(
+                "❌ No vault configured. Cannot process withdrawals."
+            )
+            return
+            
         user_id = update.effective_user.id
         
         if len(context.args) < 1:
-            await update.message.reply_text(
-                "Usage: `/confirm <amount> [tx_hash]`\n"
-                "Example: `/confirm 100 0xabc123...`"
-            )
+            # Show withdrawal info
+            try:
+                user_stats = await bot_db.get_user_stats(user_id)
+                available_balance = user_stats.get('current_balance', 0) if user_stats else 0
+                
+                msg = f"""
+💸 **Vault Withdrawal**
+
+**Available Balance:** ${available_balance:,.2f}
+**Minimum Withdrawal:** $10.00
+**Processing Time:** 1-24 hours
+
+**Usage:** `/withdraw <amount>`
+**Example:** `/withdraw 100` - Withdraw $100
+
+**Notes:**
+• Withdrawals are processed from vault balance
+• Performance fees already deducted
+• Available 24/7
+                """
+                
+                await update.message.reply_text(msg, parse_mode='Markdown')
+                
+            except Exception as e:
+                await update.message.reply_text(f"❌ Error getting withdrawal info: {str(e)}")
             return
-        
+            
         try:
             amount = float(context.args[0])
-            tx_hash = context.args[1] if len(context.args) > 1 else None
             
-            if amount < self.min_deposit:
-                await update.message.reply_text(f"❌ Minimum deposit is ${self.min_deposit}")
+            if amount < 10:
+                await update.message.reply_text("❌ Minimum withdrawal is $10.00")
                 return
             
-            # Record deposit in database
-            await bot_db.record_deposit(user_id, amount, tx_hash)
+            # Check user balance
+            user_stats = await bot_db.get_user_stats(user_id)
+            if not user_stats:
+                await update.message.reply_text("❌ No account found. Please deposit first.")
+                return
+                
+            available_balance = user_stats.get('current_balance', 0)
             
-            msg = f"""
-✅ **Deposit Confirmed!**
+            if amount > available_balance:
+                await update.message.reply_text(
+                    f"❌ Insufficient balance\n"
+                    f"Requested: ${amount:,.2f}\n"
+                    f"Available: ${available_balance:,.2f}"
+                )
+                return
+            
+            # Process withdrawal using vault transfer
+            try:
+                withdrawal_result = self.exchange.vault_transfer(
+                    vault_address=self.vault_address,
+                    is_deposit=False,  # This is a withdrawal
+                    usd=amount
+                )
+                
+                if withdrawal_result.get('status') == 'ok':
+                    # Record in database
+                    await bot_db.record_withdrawal(user_id, amount)
+                    
+                    msg = f"""
+✅ **Withdrawal Processed**
 
 • Amount: ${amount:,.2f} USDC
+• From: Vault
+• To: Your wallet
 • Status: Confirmed
-• TX Hash: {tx_hash or 'Manual entry'}
+• Remaining Balance: ${available_balance - amount:,.2f}
 
-🚀 **Your funds are now active in:**
-• Grid Trading (earning maker rebates)
-• HLP Staking (36% APR)
-• Arbitrage scanning
-
-Track performance with /vault
-            """
-            
-            await update.message.reply_text(msg, parse_mode='Markdown')
-            
+⏰ **Processing:** Funds will arrive within 24 hours
+🔗 **Transaction:** Check your wallet for confirmation
+                    """
+                    
+                    await update.message.reply_text(msg, parse_mode='Markdown')
+                    
+                else:
+                    await update.message.reply_text(
+                        f"❌ **Withdrawal Failed**\n\n"
+                        f"Error: {withdrawal_result.get('error', 'Unknown error')}\n"
+                        f"Please try again or contact support."
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Vault withdrawal error: {e}")
+                await update.message.reply_text(
+                    f"❌ **System Error**\n\n"
+                    f"Failed to process withdrawal: {str(e)}\n"
+                    f"Please try again later."
+                )
+                
         except ValueError:
-            await update.message.reply_text("❌ Invalid amount")
+            await update.message.reply_text("❌ Invalid amount. Please enter a valid number.")
         except Exception as e:
+            logger.error(f"Withdrawal command error: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
     
+    async def _get_vault_tvl(self) -> float:
+        """Get total value locked in vault"""
+        try:
+            if not self.vault_address:
+                return 0.0
+                
+            vault_state = self.info.user_state(self.vault_address)
+            return float(vault_state.get('marginSummary', {}).get('accountValue', 0))
+            
+        except Exception as e:
+            logger.error(f"Error getting vault TVL: {e}")
+            return 0.0
+
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle button callbacks with vault-specific actions"""
         query = update.callback_query

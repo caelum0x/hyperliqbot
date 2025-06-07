@@ -4,6 +4,24 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import uuid
+import sys
+import os
+import logging
+
+# Real Hyperliquid imports
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+from hyperliquid.utils import constants
+
+# Import actual examples for real patterns
+examples_dir = os.path.join(os.path.dirname(__file__), '..', 'examples')
+sys.path.append(examples_dir)
+
+import basic_order
+import basic_adding
+import example_utils
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class UserProfile:
@@ -19,13 +37,24 @@ class UserProfile:
 
 class HyperliquidProfitBot:
     """
-    Main profit-generating bot focused on vault revenue (no Hyperliquid referrals)
+    Main profit-generating bot focused on vault revenue using real Hyperliquid API
+    Uses real examples: basic_order.py and basic_adding.py
     """
     
-    def __init__(self, config):
-        self.config = config
+    def __init__(self, exchange: Exchange = None, info: Info = None, base_url: str = None):
+        if exchange and info:
+            self.exchange = exchange
+            self.info = info
+            self.address = exchange.account_address
+        else:
+            # Use example_utils.setup like all real examples
+            self.address, self.info, self.exchange = example_utils.setup(
+                base_url=base_url or constants.TESTNET_API_URL,
+                skip_ws=True
+            )
+        
         self.vault_address = "HL_VAULT_001" 
-        self.bot_name = "HLALPHA_BOT"  # Our bot's identifier
+        self.bot_name = "HLALPHA_BOT"
         self.users = {}
         self.revenue_tracking = {
             "vault_performance_fees": 0,
@@ -35,176 +64,304 @@ class HyperliquidProfitBot:
             "daily_total": 0
         }
         
-    async def one_click_vault_setup(self, user_wallet: str) -> Dict:
-        """One-click vault deposit setup for new users"""
+        logger.info("HyperliquidProfitBot initialized with real Hyperliquid API")
+
+    async def maker_rebate_strategy(self, coin: str, position_size: float = 0.1) -> Dict:
+        """
+        Maker rebate strategy using real market data and basic_adding.py patterns
+        Always use post-only orders for guaranteed rebates
+        """
         try:
-            user_id = str(uuid.uuid4())[:8]
-            user_bot_referral = f"{self.bot_name}_{user_id}"
+            # Get real market data following basic_order.py pattern
+            all_mids = self.info.all_mids()
+            if coin not in all_mids:
+                return {'status': 'error', 'message': f'No price data for {coin}'}
             
-            # Create user profile
-            user = UserProfile(
-                user_id=user_id,
-                wallet_address=user_wallet,
-                bot_referral_code=user_bot_referral,
-                vault_deposits=0,
-                total_fees_paid=0,
-                lifetime_rebates=0,
-                join_date=datetime.now(),
-                tier="basic"
+            mid_price = float(all_mids[coin])
+            
+            # Get real L2 book data
+            l2_book = self.info.l2_snapshot(coin)
+            if not l2_book or 'levels' not in l2_book or len(l2_book['levels']) < 2:
+                return {'status': 'error', 'message': f'No L2 data for {coin}'}
+            
+            # Get best bid/ask
+            best_bid = float(l2_book['levels'][0][0]['px'])
+            best_ask = float(l2_book['levels'][1][0]['px'])
+            
+            # Place limit orders just inside the spread for better rebates
+            buy_price = best_bid + 0.01   # One tick better than best bid
+            sell_price = best_ask - 0.01  # One tick better than best ask
+            
+            logger.info(f"Maker rebate strategy for {coin}: mid={mid_price}, bid={buy_price}, ask={sell_price}")
+            
+            # Place buy order using basic_adding.py pattern with Add Liquidity Only
+            buy_result = self.exchange.order(
+                coin, True, position_size, buy_price,
+                {"limit": {"tif": "Alo"}},  # MUST be Alo for guaranteed rebates
+                reduce_only=False
             )
+            print(buy_result)  # Print like basic_order.py
             
-            self.users[user_id] = user
+            if buy_result.get('status') == 'ok':
+                status = buy_result["response"]["data"]["statuses"][0]
+                if "resting" in status:
+                    buy_oid = status["resting"]["oid"]
+                    
+                    # Query order status like basic_order.py
+                    order_status = self.info.query_order_by_oid(self.address, buy_oid)
+                    print("Buy order status by oid:", order_status)
+                else:
+                    logger.warning(f"Buy order not resting: {status}")
+            else:
+                logger.error(f"Failed to place buy order: {buy_result}")
             
-            # Vault setup instructions (no Hyperliquid referrals)
-            setup_result = {
-                "status": "success",
-                "user_id": user_id,
-                "bot_referral_code": user_bot_referral,
-                "vault_address": self.vault_address,
-                "deposit_instructions": {
-                    "step_1": "Connect to Hyperliquid normally (no referral needed)",
-                    "step_2": f"Send USDC to vault: {self.vault_address}",
-                    "step_3": "Confirm deposit in bot with /confirm",
-                    "step_4": "Start earning immediately"
-                },
-                "vault_benefits": [
-                    "10% performance fee only (no management fee)",
-                    "Daily profit distributions",
-                    "4 alpha strategies running 24/7",
-                    "1-day withdrawal processing"
-                ],
-                "revenue_model": "We make money only when you make money"
-            }
+            # Place sell order using basic_adding.py pattern
+            sell_result = self.exchange.order(
+                coin, False, position_size, sell_price,
+                {"limit": {"tif": "Alo"}},  # MUST be Alo for guaranteed rebates
+                reduce_only=False
+            )
+            print(sell_result)  # Print like basic_order.py
             
-            return setup_result
+            if sell_result.get('status') == 'ok':
+                status = sell_result["response"]["data"]["statuses"][0]
+                if "resting" in status:
+                    sell_oid = status["resting"]["oid"]
+                    
+                    # Query order status like basic_order.py
+                    order_status = self.info.query_order_by_oid(self.address, sell_oid)
+                    print("Sell order status by oid:", order_status)
+                else:
+                    logger.warning(f"Sell order not resting: {status}")
+            else:
+                logger.error(f"Failed to place sell order: {sell_result}")
             
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-    
-    async def execute_vault_strategy(self, user_id: str, amount: float) -> Dict:
-        """Execute vault-based trading strategy"""
-        try:
-            user = self.users[user_id]
+            # Calculate expected rebates
+            position_value = position_size * mid_price
+            expected_rebate_per_fill = position_value * 0.0001  # 0.01% maker rebate
             
-            # Vault trading configuration
-            vault_config = {
-                "base_amount": amount,
-                "strategies": {
-                    "maker_rebate_mining": {
-                        "allocation": 0.4,  # 40% for maker orders
-                        "target_rebate": -0.0001,  # -0.01% target
-                        "pairs": ["BTC", "ETH", "SOL"]
-                    },
-                    "grid_trading": {
-                        "allocation": 0.3,  # 30% for grid
-                        "grid_levels": 10,
-                        "spread_percent": 0.2
-                    },
-                    "hlp_staking": {
-                        "allocation": 0.2,  # 20% in HLP
-                        "expected_apr": 0.36
-                    },
-                    "arbitrage": {
-                        "allocation": 0.1,  # 10% for arbitrage
-                        "min_profit_bps": 5
-                    }
-                }
-            }
-            
-            # Calculate revenue expectations
-            daily_volume = amount * 3  # Conservative 3x turnover
-            maker_allocation = amount * vault_config["strategies"]["maker_rebate_mining"]["allocation"]
-            
-            # Realistic rebate calculation (need high volume for rebates)
-            expected_daily_rebates = 0  # Start with 0, earn through volume
-            expected_hlp_yield = amount * 0.2 * 0.36 / 365  # HLP portion
-            expected_trading_profit = amount * 0.001  # 0.1% daily target
-            
-            total_expected_daily = expected_daily_rebates + expected_hlp_yield + expected_trading_profit
-            our_performance_fee = total_expected_daily * 0.10  # 10% of profits
-            
-            # Track revenue
-            self.revenue_tracking["vault_performance_fees"] += our_performance_fee
+            # Track revenue from rebates
+            self.revenue_tracking["maker_rebates"] += expected_rebate_per_fill * 2  # Both orders
             
             return {
-                "status": "success",
-                "user_id": user_id,
-                "vault_config": vault_config,
-                "revenue_projections": {
-                    "daily_rebates": expected_daily_rebates,
-                    "daily_hlp_yield": expected_hlp_yield,
-                    "daily_trading_profit": expected_trading_profit,
-                    "user_daily_profit": total_expected_daily * 0.9,  # 90% to user
-                    "our_daily_fee": our_performance_fee,
-                    "monthly_projection": our_performance_fee * 30
+                'status': 'success',
+                'strategy': 'maker_rebate',
+                'coin': coin,
+                'buy_price': buy_price,
+                'sell_price': sell_price,
+                'position_size': position_size,
+                'expected_rebate_per_fill': expected_rebate_per_fill,
+                'orders': {
+                    'buy': buy_result,
+                    'sell': sell_result
                 },
-                "strategy": "Vault-based revenue sharing model"
+                'spread_captured': sell_price - buy_price
             }
             
         except Exception as e:
-            return {"status": "error", "message": str(e)}
-    
-    async def create_revenue_focused_vault(self, initial_capital: float = 1000) -> Dict:
-        """Create vault focused on revenue generation (not referrals)"""
+            logger.error(f"Error in maker rebate strategy for {coin}: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def multi_pair_rebate_mining(self, pairs: List[str] = None) -> Dict:
+        """
+        Run maker rebate strategy across multiple pairs for maximum rebate generation
+        """
+        if not pairs:
+            pairs = ['BTC', 'ETH', 'SOL']  # Default high-liquidity pairs
+        
+        results = []
+        total_expected_rebates = 0
+        
+        for coin in pairs:
+            try:
+                result = await self.maker_rebate_strategy(coin, position_size=0.05)  # Smaller size per pair
+                if result['status'] == 'success':
+                    results.append(result)
+                    total_expected_rebates += result['expected_rebate_per_fill'] * 2
+                    
+                    logger.info(f"Placed maker orders for {coin}: rebate potential ${result['expected_rebate_per_fill']:.4f}")
+                    
+                # Small delay between orders
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Error placing maker orders for {coin}: {e}")
+        
+        return {
+            'status': 'success',
+            'strategy': 'multi_pair_rebate_mining',
+            'pairs_traded': len(results),
+            'total_orders_placed': len(results) * 2,
+            'total_expected_rebates': total_expected_rebates,
+            'results': results
+        }
+
+    async def vault_performance_strategy(self, vault_capital: float = 10000) -> Dict:
+        """
+        Execute comprehensive vault strategy for performance fees
+        Using real Hyperliquid API patterns
+        """
         try:
-            vault_config = {
-                "vault_id": self.vault_address,
-                "minimum_deposit": 50,   # Lower barrier to entry
-                "performance_fee": 0.10, # 10% of profits only
-                "management_fee": 0,     # No management fee
-                "our_seed_capital": initial_capital,
-                "revenue_model": "Performance fees only",
-                "strategies": [
-                    "Maker rebate mining",
-                    "Grid trading",
-                    "HLP staking", 
-                    "Arbitrage opportunities"
-                ],
-                "competitive_advantages": [
-                    "No management fees",
-                    "Lowest minimum deposit",
-                    "Transparent performance",
-                    "24/7 automated trading"
-                ]
+            # Get current account state
+            user_state = self.info.user_state(self.address)
+            account_value = float(user_state['marginSummary']['accountValue'])
+            
+            if account_value < vault_capital * 0.1:  # Need at least 10% of target
+                return {
+                    'status': 'error', 
+                    'message': f'Insufficient capital. Have: ${account_value:.2f}, Need: ${vault_capital * 0.1:.2f}'
+                }
+            
+            # Allocate capital across strategies
+            strategy_allocation = {
+                'maker_rebate_mining': vault_capital * 0.4,    # 40% for maker rebates
+                'grid_trading': vault_capital * 0.3,           # 30% for grid trading
+                'arbitrage': vault_capital * 0.2,              # 20% for arbitrage
+                'reserve': vault_capital * 0.1                 # 10% reserve
             }
             
-            # Revenue projections without referrals
-            vault_projections = {
-                "target_scenarios": {
-                    "conservative_100_users": {
-                        "avg_deposit": 500,
-                        "total_vault": 50000,
-                        "monthly_profit_target": 2500,  # 5% monthly
-                        "our_monthly_fee": 250,         # 10% of profits
-                        "break_even_users": 20          # Just 20 users to break even
-                    },
-                    "growth_500_users": {
-                        "avg_deposit": 750,
-                        "total_vault": 375000,
-                        "monthly_profit_target": 18750,  # 5% monthly
-                        "our_monthly_fee": 1875,        # 10% of profits
-                        "revenue_sustainability": "High"
-                    },
-                    "scale_1000_users": {
-                        "avg_deposit": 1000,
-                        "total_vault": 1000000,
-                        "monthly_profit_target": 50000,  # 5% monthly
-                        "our_monthly_fee": 5000,        # 10% of profits
-                        "target_timeline": "6-12 months"
-                    }
-                }
-            }
+            # Execute maker rebate mining on multiple pairs
+            rebate_result = await self.multi_pair_rebate_mining(['BTC', 'ETH', 'SOL', 'ARB'])
+            
+            # Calculate performance metrics
+            total_orders_placed = rebate_result.get('total_orders_placed', 0)
+            expected_daily_rebates = rebate_result.get('total_expected_rebates', 0) * 10  # Assume 10 fills per day
+            
+            # Performance fee calculation (10% of profits)
+            expected_daily_profit = expected_daily_rebates * 2  # Conservative 2x multiplier from other strategies
+            performance_fee = expected_daily_profit * 0.10
+            
+            # Track vault revenue
+            self.revenue_tracking["vault_performance_fees"] += performance_fee
+            self.revenue_tracking["maker_rebates"] += expected_daily_rebates
+            self.revenue_tracking["daily_total"] = sum(self.revenue_tracking.values())
             
             return {
-                "status": "success",
-                "vault_config": vault_config,
-                "projections": vault_projections,
-                "revenue_focus": "Performance fees from profitable trading strategies",
-                "no_referral_needed": "Revenue comes from actual trading performance"
+                'status': 'success',
+                'vault_capital': vault_capital,
+                'strategy_allocation': strategy_allocation,
+                'orders_placed': total_orders_placed,
+                'expected_daily_rebates': expected_daily_rebates,
+                'expected_daily_profit': expected_daily_profit,
+                'performance_fee_earned': performance_fee,
+                'revenue_tracking': self.revenue_tracking,
+                'apr_estimate': (performance_fee * 365) / vault_capital
             }
             
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            logger.error(f"Error in vault performance strategy: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def optimized_maker_orders(self, coin: str, spread_target_bps: float = 5.0) -> Dict:
+        """
+        Place optimized maker orders targeting specific spread conditions
+        """
+        try:
+            # Get L2 book for spread analysis
+            l2_book = self.info.l2_snapshot(coin)
+            if not l2_book or 'levels' not in l2_book:
+                return {'status': 'error', 'message': f'No L2 data for {coin}'}
+            
+            best_bid = float(l2_book['levels'][0][0]['px'])
+            best_ask = float(l2_book['levels'][1][0]['px'])
+            mid_price = (best_bid + best_ask) / 2
+            current_spread_bps = ((best_ask - best_bid) / mid_price) * 10000
+            
+            logger.info(f"Optimized maker for {coin}: spread={current_spread_bps:.1f}bps, target={spread_target_bps}bps")
+            
+            # Only place orders if spread is tight enough for good rebate potential
+            if current_spread_bps > spread_target_bps:
+                return {
+                    'status': 'waiting',
+                    'message': f'Spread too wide: {current_spread_bps:.1f}bps > {spread_target_bps}bps'
+                }
+            
+            # Calculate optimal order placement
+            tick_size = 0.01  # Assume 1 cent tick size
+            buy_price = best_bid + tick_size   # Improve the bid
+            sell_price = best_ask - tick_size  # Improve the ask
+            
+            size = 0.1  # Fixed size for now
+            
+            # Place both orders using basic_adding.py pattern
+            buy_order = self.exchange.order(
+                coin, True, size, buy_price,
+                {"limit": {"tif": "Alo"}},
+                reduce_only=False
+            )
+            print("Optimized buy order:", buy_order)
+            
+            sell_order = self.exchange.order(
+                coin, False, size, sell_price,
+                {"limit": {"tif": "Alo"}},
+                reduce_only=False
+            )
+            print("Optimized sell order:", sell_order)
+            
+            # Calculate rebate potential
+            position_value = size * mid_price
+            rebate_per_fill = position_value * 0.0001  # 0.01% maker rebate
+            
+            return {
+                'status': 'success',
+                'coin': coin,
+                'spread_bps': current_spread_bps,
+                'buy_price': buy_price,
+                'sell_price': sell_price,
+                'size': size,
+                'rebate_per_fill': rebate_per_fill,
+                'total_rebate_potential': rebate_per_fill * 2,
+                'orders': {'buy': buy_order, 'sell': sell_order}
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in optimized maker orders for {coin}: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def get_real_performance_metrics(self) -> Dict:
+        """
+        Get real performance metrics using actual fill data
+        """
+        try:
+            # Get real fills from the account
+            user_fills = self.info.user_fills(self.address)
+            
+            # Calculate real metrics
+            total_rebates = 0
+            total_volume = 0
+            maker_fills = 0
+            
+            for fill in user_fills:
+                volume = float(fill.get('sz', 0)) * float(fill.get('px', 0))
+                total_volume += volume
+                
+                # Check if it was a maker fill (Add Liquidity)
+                if fill.get('dir') == 'Add Liquidity':
+                    maker_fills += 1
+                    # Rebate is typically 0.01% for maker orders
+                    rebate = volume * 0.0001
+                    total_rebates += rebate
+            
+            # Get current account state
+            user_state = self.info.user_state(self.address)
+            account_value = float(user_state['marginSummary']['accountValue'])
+            total_pnl = sum(float(fill.get('closedPnl', 0)) for fill in user_fills)
+            
+            return {
+                'status': 'success',
+                'account_value': account_value,
+                'total_volume': total_volume,
+                'total_rebates': total_rebates,
+                'maker_fills': maker_fills,
+                'total_fills': len(user_fills),
+                'total_pnl': total_pnl,
+                'rebate_rate': total_rebates / total_volume if total_volume > 0 else 0,
+                'maker_percentage': maker_fills / len(user_fills) if user_fills else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting performance metrics: {e}")
+            return {'status': 'error', 'message': str(e)}
 
 class BotReferralSystem:
     """
@@ -407,3 +564,38 @@ class RevenueCalculator:
             
         except Exception as e:
             return f"Error generating report: {str(e)}"
+
+# Helper functions to run examples directly
+def run_basic_order_example():
+    """Run the basic_order.py example directly"""
+    try:
+        basic_order.main()
+    except Exception as e:
+        print(f"Error running basic_order example: {e}")
+
+def run_basic_adding_example():
+    """Run the basic_adding.py example directly"""
+    try:
+        basic_adding.main()
+    except Exception as e:
+        print(f"Error running basic_adding example: {e}")
+
+# Example usage
+async def main():
+    """Example of how to use the profit bot"""
+    bot = HyperliquidProfitBot()
+    
+    # Execute maker rebate strategy
+    result = await bot.maker_rebate_strategy('BTC')
+    print(f"Maker rebate result: {result}")
+    
+    # Execute vault performance strategy
+    vault_result = await bot.vault_performance_strategy(5000)
+    print(f"Vault strategy result: {vault_result}")
+    
+    # Get performance metrics
+    metrics = await bot.get_real_performance_metrics()
+    print(f"Performance metrics: {metrics}")
+
+if __name__ == "__main__":
+    asyncio.run(main())

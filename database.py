@@ -1,215 +1,353 @@
 """
-Simple database module for tracking users and profits
-Uses JSON for simplicity - upgrade to PostgreSQL for production
+SQLite database module for tracking users and profits
+Production-ready database with proper schema and indexing
 """
 
+import sqlite3
 import json
 import os
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-import asyncio
 from decimal import Decimal
 
-class BotDatabase:
-    def __init__(self, db_file: str = "bot_data.json"):
+class Database:
+    def __init__(self, db_file: str = "bot_data.db"):
         self.db_file = db_file
-        self.data = self._load_data()
+        self.connection = None
         self.lock = asyncio.Lock()
+        self._init_database()
         
-    def _load_data(self) -> Dict:
-        """Load data from JSON file"""
-        if os.path.exists(self.db_file):
-            try:
-                with open(self.db_file, 'r') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, FileNotFoundError):
-                return self._get_default_data()
-        else:
-            return self._get_default_data()
+    def _init_database(self):
+        """Initialize database with proper schema"""
+        self.connection = sqlite3.connect(self.db_file, check_same_thread=False)
+        self.connection.row_factory = sqlite3.Row
+        
+        # Create tables
+        cursor = self.connection.cursor()
+        
+        # Users table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id INTEGER PRIMARY KEY,
+                wallet_address TEXT,
+                joined TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                total_deposited REAL DEFAULT 0.0,
+                total_withdrawn REAL DEFAULT 0.0,
+                total_profit REAL DEFAULT 0.0,
+                current_balance REAL DEFAULT 0.0,
+                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                referred_by INTEGER,
+                is_active BOOLEAN DEFAULT 1
+            )
+        """)
+        
+        # Deposits table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS deposits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                tx_hash TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'confirmed',
+                type TEXT DEFAULT 'deposit',
+                FOREIGN KEY (user_id) REFERENCES users (telegram_id)
+            )
+        """)
+        
+        # Withdrawals table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                tx_hash TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'pending',
+                type TEXT DEFAULT 'withdrawal',
+                FOREIGN KEY (user_id) REFERENCES users (telegram_id)
+            )
+        """)
+        
+        # Trades table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin TEXT,
+                side TEXT,
+                size REAL,
+                price REAL,
+                notional REAL,
+                pnl REAL,
+                fee REAL,
+                fee_type TEXT,
+                vault_address TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Daily stats table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                date TEXT PRIMARY KEY,
+                vault_address TEXT,
+                account_value REAL,
+                total_pnl REAL,
+                volume_24h REAL,
+                active_users INTEGER,
+                total_deposits REAL,
+                performance_fee_earned REAL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Vault performance table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS vault_performance (
+                date TEXT PRIMARY KEY,
+                volume REAL DEFAULT 0.0,
+                pnl REAL DEFAULT 0.0,
+                fees_paid REAL DEFAULT 0.0,
+                rebates_earned REAL DEFAULT 0.0,
+                trades_count INTEGER DEFAULT 0,
+                maker_trades INTEGER DEFAULT 0,
+                taker_trades INTEGER DEFAULT 0
+            )
+        """)
+        
+        # Referrals table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER,
+                referred_id INTEGER,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                bonus_paid REAL DEFAULT 0.0,
+                FOREIGN KEY (referrer_id) REFERENCES users (telegram_id),
+                FOREIGN KEY (referred_id) REFERENCES users (telegram_id)
+            )
+        """)
+        
+        # Create indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_user ON withdrawals(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
+        
+        self.connection.commit()
     
-    def _get_default_data(self) -> Dict:
-        """Get default database structure"""
-        return {
-            "users": {},
-            "deposits": [],
-            "withdrawals": [],
-            "trades": [],
-            "daily_stats": {},
-            "referrals": {},
-            "vault_performance": {},
-            "user_profits": {}  # Track individual user profits
-        }
-            
-    async def _save_data(self):
-        """Save data to JSON file with backup"""
-        async with self.lock:
-            # Create backup
-            if os.path.exists(self.db_file):
-                backup_file = f"{self.db_file}.backup"
-                with open(self.db_file, 'r') as src, open(backup_file, 'w') as dst:
-                    dst.write(src.read())
-            
-            # Save new data
-            with open(self.db_file, 'w') as f:
-                json.dump(self.data, f, indent=2, default=str)
-                
     async def add_user(self, telegram_id: int, wallet_address: str = None, referrer_id: int = None):
         """Add new user to database"""
-        user_data = {
-            "telegram_id": telegram_id,
-            "wallet_address": wallet_address,
-            "joined": datetime.now().isoformat(),
-            "total_deposited": 0.0,
-            "total_withdrawn": 0.0,
-            "total_profit": 0.0,
-            "current_balance": 0.0,
-            "last_activity": datetime.now().isoformat(),
-            "referred_by": referrer_id,
-            "is_active": True
-        }
-        
-        self.data["users"][str(telegram_id)] = user_data
-        
-        # Handle referral
-        if referrer_id:
-            await self.add_referral(referrer_id, telegram_id)
+        async with self.lock:
+            cursor = self.connection.cursor()
             
-        await self._save_data()
-        return user_data
-        
+            # Check if user exists
+            cursor.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (telegram_id,))
+            if cursor.fetchone():
+                return await self.get_user(telegram_id)
+            
+            # Insert new user
+            cursor.execute("""
+                INSERT INTO users (telegram_id, wallet_address, referred_by)
+                VALUES (?, ?, ?)
+            """, (telegram_id, wallet_address, referrer_id))
+            
+            # Handle referral
+            if referrer_id:
+                await self.add_referral(referrer_id, telegram_id)
+            
+            self.connection.commit()
+            return await self.get_user(telegram_id)
+    
+    async def get_user(self, telegram_id: int) -> Optional[Dict]:
+        """Get user data"""
+        cursor = self.connection.cursor()
+        cursor.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    
     async def record_deposit(self, telegram_id: int, amount: float, tx_hash: str = None):
         """Record user deposit to vault"""
-        deposit = {
-            "id": len(self.data["deposits"]) + 1,
-            "user_id": telegram_id,
-            "amount": float(amount),
-            "tx_hash": tx_hash,
-            "timestamp": datetime.now().isoformat(),
-            "status": "confirmed",
-            "type": "deposit"
-        }
-        
-        self.data["deposits"].append(deposit)
-        
-        # Update user stats
-        user_id_str = str(telegram_id)
-        if user_id_str not in self.data["users"]:
-            await self.add_user(telegram_id)
+        async with self.lock:
+            cursor = self.connection.cursor()
             
-        self.data["users"][user_id_str]["total_deposited"] += amount
-        self.data["users"][user_id_str]["current_balance"] += amount
-        self.data["users"][user_id_str]["last_activity"] = datetime.now().isoformat()
+            # Insert deposit record
+            cursor.execute("""
+                INSERT INTO deposits (user_id, amount, tx_hash)
+                VALUES (?, ?, ?)
+            """, (telegram_id, amount, tx_hash))
             
-        await self._save_data()
-        return deposit
-        
+            deposit_id = cursor.lastrowid
+            
+            # Update user stats
+            cursor.execute("""
+                UPDATE users 
+                SET total_deposited = total_deposited + ?,
+                    current_balance = current_balance + ?,
+                    last_activity = CURRENT_TIMESTAMP
+                WHERE telegram_id = ?
+            """, (amount, amount, telegram_id))
+            
+            # Create user if doesn't exist
+            if cursor.rowcount == 0:
+                await self.add_user(telegram_id)
+                cursor.execute("""
+                    UPDATE users 
+                    SET total_deposited = ?,
+                        current_balance = ?,
+                        last_activity = CURRENT_TIMESTAMP
+                    WHERE telegram_id = ?
+                """, (amount, amount, telegram_id))
+            
+            self.connection.commit()
+            
+            # Return deposit record
+            cursor.execute("SELECT * FROM deposits WHERE id = ?", (deposit_id,))
+            return dict(cursor.fetchone())
+    
     async def record_withdrawal(self, telegram_id: int, amount: float, tx_hash: str = None):
         """Record user withdrawal from vault"""
-        withdrawal = {
-            "id": len(self.data["withdrawals"]) + 1,
-            "user_id": telegram_id,
-            "amount": float(amount),
-            "tx_hash": tx_hash,
-            "timestamp": datetime.now().isoformat(),
-            "status": "pending",
-            "type": "withdrawal"
-        }
-        
-        self.data["withdrawals"].append(withdrawal)
-        
-        # Update user stats
-        user_id_str = str(telegram_id)
-        if user_id_str in self.data["users"]:
-            self.data["users"][user_id_str]["total_withdrawn"] += amount
-            self.data["users"][user_id_str]["current_balance"] -= amount
-            self.data["users"][user_id_str]["last_activity"] = datetime.now().isoformat()
+        async with self.lock:
+            cursor = self.connection.cursor()
             
-        await self._save_data()
-        return withdrawal
-        
+            # Insert withdrawal record
+            cursor.execute("""
+                INSERT INTO withdrawals (user_id, amount, tx_hash)
+                VALUES (?, ?, ?)
+            """, (telegram_id, amount, tx_hash))
+            
+            withdrawal_id = cursor.lastrowid
+            
+            # Update user stats
+            cursor.execute("""
+                UPDATE users 
+                SET total_withdrawn = total_withdrawn + ?,
+                    current_balance = current_balance - ?,
+                    last_activity = CURRENT_TIMESTAMP
+                WHERE telegram_id = ?
+            """, (amount, amount, telegram_id))
+            
+            self.connection.commit()
+            
+            # Return withdrawal record
+            cursor.execute("SELECT * FROM withdrawals WHERE id = ?", (withdrawal_id,))
+            return dict(cursor.fetchone())
+    
     async def record_trade(self, coin: str, side: str, size: float, price: float, pnl: float, 
                           fee: float, fee_type: str, vault_address: str = None):
         """Record executed trade from vault"""
-        trade = {
-            "id": len(self.data["trades"]) + 1,
-            "coin": coin,
-            "side": side,
-            "size": float(size),
-            "price": float(price),
-            "notional": float(size * price),
-            "pnl": float(pnl),
-            "fee": float(fee),
-            "fee_type": fee_type,  # "maker_rebate", "taker_fee"
-            "vault_address": vault_address,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        self.data["trades"].append(trade)
-        
-        # Keep only last 5000 trades for performance
-        if len(self.data["trades"]) > 5000:
-            self.data["trades"] = self.data["trades"][-5000:]
+        async with self.lock:
+            cursor = self.connection.cursor()
             
-        # Update daily volume and profits
-        await self._update_daily_performance(trade)
-        await self._save_data()
-        return trade
-        
+            notional = size * price
+            
+            # Insert trade record
+            cursor.execute("""
+                INSERT INTO trades (coin, side, size, price, notional, pnl, fee, fee_type, vault_address)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (coin, side, size, price, notional, pnl, fee, fee_type, vault_address))
+            
+            trade_id = cursor.lastrowid
+            
+            # Update vault performance
+            await self._update_daily_performance({
+                "notional": notional,
+                "pnl": pnl,
+                "fee": fee,
+                "fee_type": fee_type
+            })
+            
+            self.connection.commit()
+            
+            # Return trade record
+            cursor.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
+            return dict(cursor.fetchone())
+    
     async def _update_daily_performance(self, trade: Dict):
         """Update daily performance metrics"""
         today = datetime.now().date().isoformat()
         
-        if today not in self.data["vault_performance"]:
-            self.data["vault_performance"][today] = {
-                "volume": 0.0,
-                "pnl": 0.0,
-                "fees_paid": 0.0,
-                "rebates_earned": 0.0,
-                "trades_count": 0,
-                "maker_trades": 0,
-                "taker_trades": 0
-            }
-        
-        daily_perf = self.data["vault_performance"][today]
-        daily_perf["volume"] += trade["notional"]
-        daily_perf["pnl"] += trade["pnl"]
-        daily_perf["trades_count"] += 1
-        
-        if trade["fee_type"] == "maker_rebate":
-            daily_perf["rebates_earned"] += abs(trade["fee"])
-            daily_perf["maker_trades"] += 1
-        else:
-            daily_perf["fees_paid"] += trade["fee"]
-            daily_perf["taker_trades"] += 1
-        
+        async with self.lock:
+            cursor = self.connection.cursor()
+            
+            # Get existing performance or create new
+            cursor.execute("SELECT * FROM vault_performance WHERE date = ?", (today,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # Update existing record
+                if trade["fee_type"] == "maker_rebate":
+                    cursor.execute("""
+                        UPDATE vault_performance 
+                        SET volume = volume + ?,
+                            pnl = pnl + ?,
+                            rebates_earned = rebates_earned + ?,
+                            trades_count = trades_count + 1,
+                            maker_trades = maker_trades + 1
+                        WHERE date = ?
+                    """, (trade["notional"], trade["pnl"], abs(trade["fee"]), today))
+                else:
+                    cursor.execute("""
+                        UPDATE vault_performance 
+                        SET volume = volume + ?,
+                            pnl = pnl + ?,
+                            fees_paid = fees_paid + ?,
+                            trades_count = trades_count + 1,
+                            taker_trades = taker_trades + 1
+                        WHERE date = ?
+                    """, (trade["notional"], trade["pnl"], trade["fee"], today))
+            else:
+                # Create new record
+                if trade["fee_type"] == "maker_rebate":
+                    cursor.execute("""
+                        INSERT INTO vault_performance 
+                        (date, volume, pnl, rebates_earned, trades_count, maker_trades)
+                        VALUES (?, ?, ?, ?, 1, 1)
+                    """, (today, trade["notional"], trade["pnl"], abs(trade["fee"])))
+                else:
+                    cursor.execute("""
+                        INSERT INTO vault_performance 
+                        (date, volume, pnl, fees_paid, trades_count, taker_trades)
+                        VALUES (?, ?, ?, ?, 1, 1)
+                    """, (today, trade["notional"], trade["pnl"], trade["fee"]))
+    
     async def get_user_stats(self, telegram_id: int) -> Optional[Dict]:
         """Get comprehensive user statistics"""
-        user_data = self.data["users"].get(str(telegram_id))
+        cursor = self.connection.cursor()
+        
+        # Get user data
+        user_data = await self.get_user(telegram_id)
         if not user_data:
             return None
         
-        # Calculate user's vault share
-        total_vault_deposits = sum(d["amount"] for d in self.data["deposits"] 
-                                 if d["status"] == "confirmed")
-        user_deposits = user_data["total_deposited"]
+        # Get total vault deposits
+        cursor.execute("""
+            SELECT SUM(amount) as total FROM deposits WHERE status = 'confirmed'
+        """)
+        total_vault_deposits = cursor.fetchone()["total"] or 0
         
+        # Calculate vault share
+        user_deposits = user_data["total_deposited"]
         vault_share = user_deposits / total_vault_deposits if total_vault_deposits > 0 else 0
         
-        # Calculate recent performance (last 7 days)
+        # Get recent performance (last 7 days)
         week_ago = (datetime.now() - timedelta(days=7)).date().isoformat()
-        recent_performance = {}
+        cursor.execute("""
+            SELECT 
+                SUM(volume) as volume,
+                SUM(pnl) as pnl,
+                SUM(trades_count) as trades_count
+            FROM vault_performance 
+            WHERE date >= ?
+        """, (week_ago,))
         
-        for date, perf in self.data["vault_performance"].items():
-            if date >= week_ago:
-                for key, value in perf.items():
-                    recent_performance[key] = recent_performance.get(key, 0) + value
+        recent_perf = cursor.fetchone()
+        vault_pnl = recent_perf["pnl"] or 0
         
-        # Calculate user's share of profits
-        vault_pnl = recent_performance.get("pnl", 0)
-        user_profit_share = vault_pnl * vault_share * 0.9  # 90% after performance fee
-        
-        # Get user's total profit
-        total_user_profit = user_data.get("total_profit", 0) + user_profit_share
+        # Calculate user's share of profits (90% after performance fee)
+        user_profit_share = vault_pnl * vault_share * 0.9
+        total_user_profit = user_data["total_profit"] + user_profit_share
         
         # Calculate ROI
         roi = (total_user_profit / user_deposits * 100) if user_deposits > 0 else 0
@@ -226,199 +364,247 @@ class BotDatabase:
             "recent_profit": user_profit_share,
             "total_profit": total_user_profit,
             "roi_pct": roi,
-            "recent_volume": recent_performance.get("volume", 0),
+            "recent_volume": recent_perf["volume"] or 0,
             "is_active": user_data.get("is_active", True),
             "last_activity": user_data.get("last_activity")
         }
-        
+    
     async def update_daily_stats(self, vault_address: str, account_value: float, 
                                total_pnl: float, volume_24h: float):
         """Update daily vault statistics"""
         today = datetime.now().date().isoformat()
         
-        self.data["daily_stats"][today] = {
-            "vault_address": vault_address,
-            "account_value": float(account_value),
-            "total_pnl": float(total_pnl),
-            "volume_24h": float(volume_24h),
-            "active_users": len([u for u in self.data["users"].values() 
-                               if u.get("is_active", True)]),
-            "total_deposits": sum(d["amount"] for d in self.data["deposits"] 
-                                if d["status"] == "confirmed"),
-            "performance_fee_earned": max(0, total_pnl * 0.1),
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        await self._save_data()
-        
+        async with self.lock:
+            cursor = self.connection.cursor()
+            
+            # Get active users count
+            cursor.execute("SELECT COUNT(*) as count FROM users WHERE is_active = 1")
+            active_users = cursor.fetchone()["count"]
+            
+            # Get total deposits
+            cursor.execute("SELECT SUM(amount) as total FROM deposits WHERE status = 'confirmed'")
+            total_deposits = cursor.fetchone()["total"] or 0
+            
+            # Insert or update daily stats
+            cursor.execute("""
+                INSERT OR REPLACE INTO daily_stats 
+                (date, vault_address, account_value, total_pnl, volume_24h, 
+                 active_users, total_deposits, performance_fee_earned)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (today, vault_address, account_value, total_pnl, volume_24h,
+                  active_users, total_deposits, max(0, total_pnl * 0.1)))
+            
+            self.connection.commit()
+    
     async def get_vault_stats(self) -> Dict:
         """Get comprehensive vault statistics"""
-        total_deposits = sum(d["amount"] for d in self.data["deposits"] 
-                           if d["status"] == "confirmed")
-        total_withdrawals = sum(w["amount"] for w in self.data["withdrawals"] 
-                              if w["status"] == "completed")
+        cursor = self.connection.cursor()
         
-        # Calculate performance metrics
-        all_trades = self.data["trades"]
-        if all_trades:
-            total_pnl = sum(t["pnl"] for t in all_trades)
-            total_volume = sum(t["notional"] for t in all_trades)
-            total_rebates = sum(abs(t["fee"]) for t in all_trades 
-                              if t["fee_type"] == "maker_rebate")
-            total_fees = sum(t["fee"] for t in all_trades 
-                           if t["fee_type"] == "taker_fee")
-            
-            maker_trades = len([t for t in all_trades if t["fee_type"] == "maker_rebate"])
-            maker_pct = (maker_trades / len(all_trades) * 100) if all_trades else 0
-        else:
-            total_pnl = total_volume = total_rebates = total_fees = maker_pct = 0
+        # Get deposits/withdrawals
+        cursor.execute("""
+            SELECT 
+                SUM(CASE WHEN status = 'confirmed' THEN amount ELSE 0 END) as total_deposits
+            FROM deposits
+        """)
+        deposits_data = cursor.fetchone()
         
-        # Recent performance (last 24h)
+        cursor.execute("""
+            SELECT 
+                SUM(CASE WHEN status = 'completed' THEN amount ELSE 0 END) as total_withdrawals
+            FROM withdrawals
+        """)
+        withdrawals_data = cursor.fetchone()
+        
+        # Get trading stats
+        cursor.execute("""
+            SELECT 
+                SUM(pnl) as total_pnl,
+                SUM(notional) as total_volume,
+                SUM(CASE WHEN fee_type = 'maker_rebate' THEN ABS(fee) ELSE 0 END) as total_rebates,
+                SUM(CASE WHEN fee_type = 'taker_fee' THEN fee ELSE 0 END) as total_fees,
+                COUNT(*) as total_trades,
+                SUM(CASE WHEN fee_type = 'maker_rebate' THEN 1 ELSE 0 END) as maker_trades
+            FROM trades
+        """)
+        trade_stats = cursor.fetchone()
+        
+        # Get recent performance (last 24h)
         yesterday = (datetime.now() - timedelta(days=1)).date().isoformat()
-        today = datetime.now().date().isoformat()
+        cursor.execute("""
+            SELECT 
+                SUM(volume) as volume,
+                SUM(pnl) as pnl,
+                SUM(trades_count) as trades_count
+            FROM vault_performance 
+            WHERE date >= ?
+        """, (yesterday,))
+        recent_perf = cursor.fetchone()
         
-        recent_perf = {"volume": 0, "pnl": 0, "trades_count": 0}
-        for date in [yesterday, today]:
-            if date in self.data["vault_performance"]:
-                perf = self.data["vault_performance"][date]
-                recent_perf["volume"] += perf.get("volume", 0)
-                recent_perf["pnl"] += perf.get("pnl", 0)
-                recent_perf["trades_count"] += perf.get("trades_count", 0)
+        # Get active users
+        cursor.execute("SELECT COUNT(*) as count FROM users WHERE is_active = 1")
+        active_users = cursor.fetchone()["count"]
+        
+        total_deposits = deposits_data["total_deposits"] or 0
+        total_withdrawals = withdrawals_data["total_withdrawals"] or 0
+        total_pnl = trade_stats["total_pnl"] or 0
+        total_trades = trade_stats["total_trades"] or 0
+        maker_trades = trade_stats["maker_trades"] or 0
         
         return {
             "total_deposits": total_deposits,
             "total_withdrawals": total_withdrawals,
             "net_deposits": total_deposits - total_withdrawals,
             "total_pnl": total_pnl,
-            "total_volume": total_volume,
-            "total_rebates": total_rebates,
-            "total_fees_paid": total_fees,
-            "net_fees": total_rebates - total_fees,
-            "total_trades": len(all_trades),
-            "maker_percentage": maker_pct,
-            "active_users": len([u for u in self.data["users"].values() 
-                               if u.get("is_active", True)]),
+            "total_volume": trade_stats["total_volume"] or 0,
+            "total_rebates": trade_stats["total_rebates"] or 0,
+            "total_fees_paid": trade_stats["total_fees"] or 0,
+            "net_fees": (trade_stats["total_rebates"] or 0) - (trade_stats["total_fees"] or 0),
+            "total_trades": total_trades,
+            "maker_percentage": (maker_trades / total_trades * 100) if total_trades > 0 else 0,
+            "active_users": active_users,
             "performance_fees_earned": max(0, total_pnl * 0.1),
-            "daily_volume": recent_perf["volume"],
-            "daily_pnl": recent_perf["pnl"],
-            "daily_trades": recent_perf["trades_count"]
+            "daily_volume": recent_perf["volume"] or 0,
+            "daily_pnl": recent_perf["pnl"] or 0,
+            "daily_trades": recent_perf["trades_count"] or 0
         }
-        
+    
     async def add_referral(self, referrer_id: int, referred_id: int):
         """Track referral relationship"""
-        referrer_str = str(referrer_id)
-        
-        if referrer_str not in self.data["referrals"]:
-            self.data["referrals"][referrer_str] = {
-                "total_referrals": 0,
-                "total_earnings": 0.0,
-                "referrals": []
-            }
+        async with self.lock:
+            cursor = self.connection.cursor()
             
-        self.data["referrals"][referrer_str]["referrals"].append({
-            "user_id": referred_id,
-            "timestamp": datetime.now().isoformat(),
-            "bonus_paid": 0.0
-        })
-        
-        self.data["referrals"][referrer_str]["total_referrals"] += 1
-        
-        # Update referred user
-        if str(referred_id) in self.data["users"]:
-            self.data["users"][str(referred_id)]["referred_by"] = referrer_id
+            cursor.execute("""
+                INSERT INTO referrals (referrer_id, referred_id)
+                VALUES (?, ?)
+            """, (referrer_id, referred_id))
             
-        await self._save_data()
-        
+            self.connection.commit()
+    
     async def pay_referral_bonus(self, referrer_id: int, referred_id: int, amount: float):
         """Pay referral bonus"""
-        referrer_str = str(referrer_id)
-        
-        if referrer_str in self.data["referrals"]:
-            # Update referral earnings
-            self.data["referrals"][referrer_str]["total_earnings"] += amount
+        async with self.lock:
+            cursor = self.connection.cursor()
             
-            # Find and update specific referral
-            for ref in self.data["referrals"][referrer_str]["referrals"]:
-                if ref["user_id"] == referred_id:
-                    ref["bonus_paid"] += amount
-                    break
+            # Update referral bonus
+            cursor.execute("""
+                UPDATE referrals 
+                SET bonus_paid = bonus_paid + ?
+                WHERE referrer_id = ? AND referred_id = ?
+            """, (amount, referrer_id, referred_id))
             
-            # Update referrer's user account
-            if referrer_str in self.data["users"]:
-                self.data["users"][referrer_str]["total_profit"] += amount
-                
-        await self._save_data()
-        
+            # Update referrer's profit
+            cursor.execute("""
+                UPDATE users 
+                SET total_profit = total_profit + ?
+                WHERE telegram_id = ?
+            """, (amount, referrer_id))
+            
+            self.connection.commit()
+    
     async def get_referral_stats(self, telegram_id: int) -> Dict:
         """Get user's referral statistics"""
-        referrals_data = self.data["referrals"].get(str(telegram_id), {
-            "total_referrals": 0,
-            "total_earnings": 0.0,
-            "referrals": []
-        })
+        cursor = self.connection.cursor()
         
-        # Calculate active referrals (users who deposited)
-        active_referrals = 0
-        for ref in referrals_data["referrals"]:
-            user_data = self.data["users"].get(str(ref["user_id"]))
-            if user_data and user_data["total_deposited"] > 0:
-                active_referrals += 1
+        # Get referral stats
+        cursor.execute("""
+            SELECT 
+                COUNT(*) as total_referrals,
+                SUM(bonus_paid) as total_earnings
+            FROM referrals 
+            WHERE referrer_id = ?
+        """, (telegram_id,))
+        
+        stats = cursor.fetchone()
+        
+        # Get active referrals (users who deposited)
+        cursor.execute("""
+            SELECT COUNT(*) as count
+            FROM referrals r
+            JOIN users u ON r.referred_id = u.telegram_id
+            WHERE r.referrer_id = ? AND u.total_deposited > 0
+        """, (telegram_id,))
+        
+        active_referrals = cursor.fetchone()["count"]
+        
+        # Get recent referrals
+        cursor.execute("""
+            SELECT referred_id, timestamp, bonus_paid
+            FROM referrals 
+            WHERE referrer_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 5
+        """, (telegram_id,))
+        
+        recent_referrals = [dict(row) for row in cursor.fetchall()]
         
         return {
-            "total_referrals": referrals_data["total_referrals"],
+            "total_referrals": stats["total_referrals"] or 0,
             "active_referrals": active_referrals,
-            "total_earnings": referrals_data["total_earnings"],
+            "total_earnings": stats["total_earnings"] or 0.0,
             "referral_link": f"https://t.me/HyperLiquidBot?start=ref_{telegram_id}",
-            "recent_referrals": referrals_data["referrals"][-5:]  # Last 5 referrals
+            "recent_referrals": recent_referrals
         }
     
     async def get_leaderboard(self, metric: str = "profit", limit: int = 10) -> List[Dict]:
         """Get user leaderboard by different metrics"""
-        users = []
+        cursor = self.connection.cursor()
         
-        for telegram_id, user_data in self.data["users"].items():
-            if not user_data.get("is_active", True):
-                continue
-                
-            user_stats = await self.get_user_stats(int(telegram_id))
-            if user_stats:
-                users.append(user_stats)
-        
-        # Sort by metric
         if metric == "profit":
-            users.sort(key=lambda x: x["total_profit"], reverse=True)
+            cursor.execute("""
+                SELECT telegram_id, total_profit as value
+                FROM users 
+                WHERE is_active = 1
+                ORDER BY total_profit DESC
+                LIMIT ?
+            """, (limit,))
         elif metric == "deposits":
-            users.sort(key=lambda x: x["total_deposited"], reverse=True)
+            cursor.execute("""
+                SELECT telegram_id, total_deposited as value
+                FROM users 
+                WHERE is_active = 1
+                ORDER BY total_deposited DESC
+                LIMIT ?
+            """, (limit,))
         elif metric == "roi":
-            users.sort(key=lambda x: x["roi_pct"], reverse=True)
-        elif metric == "volume":
-            users.sort(key=lambda x: x["recent_volume"], reverse=True)
+            cursor.execute("""
+                SELECT telegram_id, 
+                       CASE WHEN total_deposited > 0 
+                            THEN (total_profit / total_deposited * 100)
+                            ELSE 0 END as value
+                FROM users 
+                WHERE is_active = 1 AND total_deposited > 0
+                ORDER BY value DESC
+                LIMIT ?
+            """, (limit,))
         
-        return users[:limit]
+        leaderboard = []
+        for row in cursor.fetchall():
+            user_stats = await self.get_user_stats(row["telegram_id"])
+            if user_stats:
+                leaderboard.append(user_stats)
+        
+        return leaderboard
     
     async def cleanup_old_data(self, days_to_keep: int = 30):
         """Clean up old data to keep database performant"""
         cutoff_date = (datetime.now() - timedelta(days=days_to_keep)).date().isoformat()
         
-        # Clean old daily stats
-        old_dates = [date for date in self.data["vault_performance"].keys() 
-                    if date < cutoff_date]
-        for date in old_dates:
-            del self.data["vault_performance"][date]
+        async with self.lock:
+            cursor = self.connection.cursor()
             
-        # Clean old daily stats
-        old_daily_dates = [date for date in self.data["daily_stats"].keys() 
-                          if date < cutoff_date]
-        for date in old_daily_dates:
-            del self.data["daily_stats"][date]
-        
-        await self._save_data()
-        
+            # Clean old vault performance data
+            cursor.execute("DELETE FROM vault_performance WHERE date < ?", (cutoff_date,))
+            
+            # Clean old daily stats
+            cursor.execute("DELETE FROM daily_stats WHERE date < ?", (cutoff_date,))
+            
+            self.connection.commit()
+
 
 # Singleton instance
-bot_db = BotDatabase()
+bot_db = Database()
 
-# Utility functions
+# Utility functions for backward compatibility
 async def get_user_stats(telegram_id: int) -> Optional[Dict]:
     """Get user stats - convenience function"""
     return await bot_db.get_user_stats(telegram_id)
@@ -432,40 +618,38 @@ async def get_vault_performance() -> Dict:
     return await bot_db.get_vault_stats()
 
 
-# Usage example and testing
+# Testing
 async def test_database():
     """Test database functionality"""
-    db = BotDatabase("test_bot_data.json")
+    db = Database("test_bot_data.db")
     
     # Add users
     await db.add_user(123456789, "0x1234...", None)
-    await db.add_user(987654321, "0x5678...", 123456789)  # Referred user
+    await db.add_user(987654321, "0x5678...", 123456789)
     
     # Record deposits
     await db.record_deposit(123456789, 1000.0, "0xabcd...")
     await db.record_deposit(987654321, 500.0, "0xefgh...")
     
-    # Record some trades
+    # Record trades
     await db.record_trade("ETH", "buy", 0.5, 3000, 15.0, -0.03, "maker_rebate")
     await db.record_trade("BTC", "sell", 0.01, 65000, 25.0, 0.23, "taker_fee")
     
     # Update daily stats
     await db.update_daily_stats("0xVault...", 1600.0, 40.0, 125000.0)
     
-    # Get stats
-    user_stats = await db.get_user_stats(123456789)
-    vault_stats = await db.get_vault_stats()
-    referral_stats = await db.get_referral_stats(123456789)
-    leaderboard = await db.get_leaderboard("profit", 5)
-    
+    # Test all functionality
     print("=== User Stats ===")
+    user_stats = await db.get_user_stats(123456789)
     print(json.dumps(user_stats, indent=2, default=str))
+    
     print("\n=== Vault Stats ===")
+    vault_stats = await db.get_vault_stats()
     print(json.dumps(vault_stats, indent=2, default=str))
+    
     print("\n=== Referral Stats ===")
+    referral_stats = await db.get_referral_stats(123456789)
     print(json.dumps(referral_stats, indent=2, default=str))
-    print("\n=== Leaderboard ===")
-    print(json.dumps(leaderboard, indent=2, default=str))
 
 
 if __name__ == "__main__":

@@ -4,11 +4,39 @@ import time
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import logging
+import sys
+import os
 
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from hyperliquid.utils.types import *
+from trading_engine import main_bot, referral_manager, vault_manager, websocket_manager
+
+# Import ALL actual examples from examples folder
+examples_dir = os.path.join(os.path.dirname(__file__), '..', 'examples')
+sys.path.append(examples_dir)
+
+import basic_adding
+import basic_agent
+import basic_builder_fee
+import basic_leverage_adjustment
+import basic_market_order
+import basic_order
+import basic_order_modify
+import basic_schedule_cancel
+import basic_set_referrer
+import basic_spot_order
+import basic_spot_transfer
+import basic_sub_account
+import basic_tpsl
+import basic_transfer
+import basic_vault
+import basic_vault_transfer
+import basic_withdraw
+import basic_ws
+import cancel_open_orders
+import example_utils
 
 @dataclass
 class TradingConfig:
@@ -41,406 +69,480 @@ class TradingConfig:
     referral_user_discount: float = 0.004    # 4% fee discount
     referral_volume_limit: float = 25000000  # $25M per referee
 
-class ProfitOptimizedTrader:
+class TradingEngineContext:
     """
-    Core trading engine optimized based on actual Hyperliquid features
+    TradingEngineContext exposes all trading engine modules and helpers for orchestrated bot use.
+    """
+    def __init__(self):
+        self.basic_leverage_adjustment = basic_leverage_adjustment
+        self.basic_schedule_cancel = basic_schedule_cancel
+        self.cancel_open_orders = cancel_open_orders
+        self.example_utils = example_utils
+        self.main_bot = main_bot
+        self.referral_manager = referral_manager
+        self.vault_manager = vault_manager
+        self.websocket_manager = websocket_manager
+
+    def info(self):
+        """
+        Print available trading engine modules for debugging.
+        """
+        print("Trading Engine Modules Loaded:")
+        print(" - basic_leverage_adjustment")
+        print(" - basic_schedule_cancel")
+        print(" - cancel_open_orders")
+        print(" - example_utils")
+        print(" - main_bot")
+        print(" - referral_manager")
+        print(" - vault_manager")
+        print(" - websocket_manager")
+
+class TradingEngine:
+    """
+    Core trading engine using actual Hyperliquid API examples
+    Now imports and uses ALL available examples
     """
     
-    def __init__(self, exchange: Exchange, info: Info, config: TradingConfig):
-        self.exchange = exchange
-        self.info = info
-        self.config = config
-        self.active_orders = {}
-        self.profit_tracker = {}
-        self.user_stats = {"14d_volume": 0, "14d_maker_volume": 0}
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, base_url=None, account=None, wallet_manager=None):
+        if wallet_manager:
+            self.wallet_manager = wallet_manager
+            self.address = None  # Will be set when using specific wallet
+            self.info = wallet_manager.info
+            self.exchange = None  # Will be set when using specific wallet
+        else:
+            # Use example_utils.setup exactly as all examples do
+            self.address, self.info, self.exchange = example_utils.setup(
+                base_url=base_url or constants.TESTNET_API_URL,
+                skip_ws=True
+            )
+            self.wallet_manager = None
         
-    async def get_current_fee_tier(self) -> Dict:
-        """Get current fee tier based on 14-day volume"""
+        self.logger = logging.getLogger(__name__)
+
+    def use_wallet(self, wallet_name: str, sub_account_name: str = None):
+        """Switch to using a specific wallet or sub-account"""
+        if not self.wallet_manager:
+            raise ValueError("No wallet manager available")
+        
+        wallet = self.wallet_manager.get_wallet(wallet_name)
+        if not wallet:
+            raise ValueError(f"Wallet '{wallet_name}' not found")
+        
+        if sub_account_name:
+            # Use sub-account following basic_sub_account.py pattern
+            sub_accounts = self.wallet_manager.get_sub_accounts(wallet_name)
+            sub_account = None
+            for sa in sub_accounts:
+                if sa.name == sub_account_name:
+                    sub_account = sa
+                    break
+            
+            if not sub_account:
+                raise ValueError(f"Sub-account '{sub_account_name}' not found")
+            
+            # Create exchange with vault_address set to sub-account (basic_vault.py pattern)
+            self.exchange = self.wallet_manager.get_exchange(wallet_name, vault_address=sub_account.address)
+            self.address = sub_account.address
+            self.logger.info(f"Using sub-account '{sub_account_name}' at {sub_account.address}")
+        else:
+            # Use main wallet
+            self.exchange = self.wallet_manager.get_exchange(wallet_name)
+            self.address = wallet.address
+            self.logger.info(f"Using wallet '{wallet_name}' at {wallet.address}")
+
+    async def create_and_fund_sub_account(self, parent_wallet_name: str, sub_account_name: str, 
+                                        usd_amount: float = 1.0, token_transfers: List[Dict] = None):
+        """Create and fund sub-account using wallet manager's basic_sub_account integration"""
+        if not self.wallet_manager:
+            raise ValueError("No wallet manager available")
+        
+        return self.wallet_manager.create_and_fund_sub_account(
+            parent_wallet_name, sub_account_name, usd_amount, token_transfers
+        )
+
+    async def place_limit_order(self, coin, is_buy, size, price):
+        """Place limit order using basic_order.py pattern exactly"""
         try:
-            volume_14d = self.user_stats["14d_volume"]
-            maker_volume_14d = self.user_stats["14d_maker_volume"]
-            maker_percentage = maker_volume_14d / volume_14d if volume_14d > 0 else 0
+            # Exact pattern from basic_order.py main() function
+            order_result = self.exchange.order(coin, is_buy, size, price, {"limit": {"tif": "Gtc"}})
+            print(order_result)
             
-            # Determine fee tier
-            if volume_14d < self.config.tier_1_volume:
-                taker_fee = 0.00035
-                maker_fee = 0.0001
-            elif volume_14d < self.config.tier_2_volume:
-                taker_fee = 0.000325
-                maker_fee = 0.00005
-            elif volume_14d < self.config.tier_3_volume:
-                taker_fee = 0.0003
-                maker_fee = 0.0
+            if order_result["status"] == "ok":
+                status = order_result["response"]["data"]["statuses"][0]
+                if "resting" in status:
+                    order_status = self.info.query_order_by_oid(self.address, status["resting"]["oid"])
+                    print("Order status by oid:", order_status)
+            
+            self.logger.info(f"Limit order placed: {coin} {size}@{price}")
+            return order_result
+        except Exception as e:
+            self.logger.error(f"Error placing limit order: {e}")
+            return {"status": "error", "message": str(e)}
+        
+    async def place_market_order(self, coin, is_buy, size):
+        """Place market order using basic_market_order.py pattern exactly"""
+        try:
+            # Exact pattern from basic_market_order.py
+            order_result = self.exchange.market_open(coin, is_buy, size, None, 0.01)
+            print(order_result)
+            self.logger.info(f"Market order placed: {coin} {size}")
+            return order_result
+        except Exception as e:
+            self.logger.error(f"Error placing market order: {e}")
+            return {"status": "error", "message": str(e)}
+        
+    async def place_adding_liquidity_order(self, coin, is_buy, size, price):
+        """Place add liquidity order using basic_adding.py pattern exactly"""
+        try:
+            # Exact pattern from basic_adding.py for guaranteed maker rebates
+            order_result = self.exchange.order(coin, is_buy, size, price, {"limit": {"tif": "Alo"}})
+            print(order_result)
+            
+            if order_result["status"] == "ok":
+                status = order_result["response"]["data"]["statuses"][0]
+                if "resting" in status:
+                    order_status = self.info.query_order_by_oid(self.address, status["resting"]["oid"])
+                    print("Order status by oid:", order_status)
+            
+            self.logger.info(f"Add liquidity order placed: {coin} {size}@{price}")
+            return order_result
+        except Exception as e:
+            self.logger.error(f"Error placing add liquidity order: {e}")
+            return {"status": "error", "message": str(e)}
+        
+    async def place_tpsl_order(self, coin, is_buy, size, price, tp_price=None, sl_price=None):
+        """Place order with take profit/stop loss using basic_tpsl.py pattern"""
+        try:
+            # Construct TPSL order following basic_tpsl.py pattern
+            order_type = {"limit": {"tif": "Gtc"}}
+            
+            if tp_price or sl_price:
+                order_type["tpsl"] = []
+                if tp_price:
+                    order_type["tpsl"].append({
+                        "trigger": {"px": tp_price, "isMarket": True, "sz": size},
+                        "condition": "tp"
+                    })
+                if sl_price:
+                    order_type["tpsl"].append({
+                        "trigger": {"px": sl_price, "isMarket": True, "sz": size},
+                        "condition": "sl"
+                    })
+            
+            order_result = self.exchange.order(coin, is_buy, size, price, order_type)
+            print(order_result)
+            
+            self.logger.info(f"TPSL order placed: {coin} {size}@{price} TP:{tp_price} SL:{sl_price}")
+            return order_result
+        except Exception as e:
+            self.logger.error(f"Error placing TPSL order: {e}")
+            return {"status": "error", "message": str(e)}
+        
+    async def modify_order(self, coin, oid, new_price, new_size=None):
+        """Modify order using basic_order_modify.py pattern"""
+        try:
+            # Use basic_order_modify.py pattern
+            modify_result = self.exchange.modify_order(coin, oid, new_price, new_size)
+            print(modify_result)
+            
+            self.logger.info(f"Order modified: {coin} oid:{oid} new_price:{new_price}")
+            return modify_result
+        except Exception as e:
+            self.logger.error(f"Error modifying order: {e}")
+            return {"status": "error", "message": str(e)}
+        
+    async def set_referrer(self, referrer_code: str):
+        """Set referrer using basic_set_referrer.py pattern"""
+        try:
+            # Use basic_set_referrer.py pattern
+            result = self.exchange.set_referrer(referrer_code)
+            print(result)
+            
+            self.logger.info(f"Referrer set: {referrer_code}")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error setting referrer: {e}")
+            return {"status": "error", "message": str(e)}
+        
+    async def place_spot_order(self, coin, is_buy, size, price):
+        """Place spot order using basic_spot_order.py pattern"""
+        try:
+            # Use basic_spot_order.py pattern
+            order_result = self.exchange.spot_order(coin, is_buy, size, price, {"limit": {"tif": "Gtc"}})
+            print(order_result)
+            
+            self.logger.info(f"Spot order placed: {coin} {size}@{price}")
+            return order_result
+        except Exception as e:
+            self.logger.error(f"Error placing spot order: {e}")
+            return {"status": "error", "message": str(e)}
+        
+    async def transfer_spot(self, amount, destination, token):
+        """Transfer spot tokens using basic_spot_transfer.py pattern"""
+        try:
+            # Check permissions like basic_spot_transfer.py
+            if self.exchange.account_address != self.exchange.wallet.address:
+                return {"status": "error", "message": "Agents do not have permission to perform internal transfers"}
+            
+            # Use basic_spot_transfer.py pattern
+            transfer_result = self.exchange.spot_transfer(amount, destination, token)
+            print(transfer_result)
+            
+            self.logger.info(f"Spot transfer: {amount} {token} to {destination}")
+            return transfer_result
+        except Exception as e:
+            self.logger.error(f"Error transferring spot: {e}")
+            return {"status": "error", "message": str(e)}
+        
+    async def withdraw_from_bridge(self, amount, destination=None):
+        """Withdraw using basic_withdraw.py pattern"""
+        try:
+            # Check permissions like basic_withdraw.py
+            if self.exchange.account_address != self.exchange.wallet.address:
+                return {"status": "error", "message": "Agents do not have permission to perform withdrawals"}
+            
+            destination = destination or self.address
+            
+            # Use basic_withdraw.py pattern
+            withdraw_result = self.exchange.withdraw_from_bridge(amount, destination)
+            print(withdraw_result)
+            
+            self.logger.info(f"Withdrawal: ${amount} to {destination}")
+            return withdraw_result
+        except Exception as e:
+            self.logger.error(f"Error withdrawing: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def cancel_order(self, coin, oid):
+        """Cancel order using basic_cancel.py pattern"""
+        try:
+            # Pattern from basic_cancel.py
+            cancel_result = self.exchange.cancel(coin, oid)
+            print(cancel_result)
+            self.logger.info(f"Order cancelled: {coin} oid:{oid}")
+            return cancel_result
+        except Exception as e:
+            self.logger.error(f"Error cancelling order: {e}")
+            return {"status": "error", "message": str(e)}
+        
+    async def cancel_all_orders(self):
+        """Cancel all open orders using cancel_open_orders.py pattern"""
+        try:
+            # From api/examples/cancel_open_orders.py
+            open_orders = self.info.open_orders(self.address)
+            results = []
+            for open_order in open_orders:
+                print(f"cancelling order {open_order}")
+                result = self.exchange.cancel(open_order["coin"], open_order["oid"])
+                results.append(result)
+            return results
+        except Exception as e:
+            self.logger.error(f"Error cancelling all orders: {e}")
+            return [{"status": "error", "message": str(e)}]
+        
+    async def adjust_leverage(self, coin, leverage, is_cross=True):
+        """Adjust leverage using basic_leverage_adjustment.py pattern"""
+        try:
+            # Pattern from basic_leverage_adjustment.py
+            result = self.exchange.update_leverage(leverage, coin, is_cross)
+            print(result)
+            self.logger.info(f"Leverage adjusted: {coin} {leverage}x {'cross' if is_cross else 'isolated'}")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error adjusting leverage: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def update_isolated_margin(self, coin: str, amount: float, is_buy: bool = True):
+        """
+        Update isolated margin for a position, using basic_leverage_adjustment.py pattern.
+        Note: The Hyperliquid SDK's update_isolated_margin takes a signed amount.
+        This method simplifies it by taking an absolute amount and a direction (is_buy implies adding margin).
+        Adjust 'is_buy' to False if you intend to remove margin, though the SDK might not directly support negative values in this specific call.
+        The SDK's `update_isolated_margin` expects `amount_usd` which is the change in margin.
+        """
+        try:
+            # The SDK's update_isolated_margin expects amount_usd as the change.
+            # Positive to add margin, negative to remove (if supported by the specific call).
+            # For simplicity, this example assumes adding margin.
+            # If 'is_buy' is False, it implies reducing margin, which might need a negative amount.
+            # However, the example `exchange.update_isolated_margin(1, "ETH")` adds $1.
+            # Let's assume 'amount' is always positive and we are adding margin.
+            # If removing margin is intended, the SDK might require a different approach or validation.
+            
+            margin_change = amount # Positive for adding margin
+            
+            result = self.exchange.update_isolated_margin(margin_change, coin)
+            print(result)
+            self.logger.info(f"Isolated margin updated for {coin} by ${margin_change}")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error updating isolated margin for {coin}: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def schedule_cancel_all_orders(self, cancel_time_ms: Optional[int] = None, delay_seconds: int = 10):
+        """
+        Schedule cancellation of all open orders using basic_schedule_cancel.py pattern.
+        If cancel_time_ms is not provided, it will be set to delay_seconds from now.
+        """
+        try:
+            if cancel_time_ms is None:
+                from hyperliquid.utils.signing import get_timestamp_ms
+                cancel_time_ms = get_timestamp_ms() + (delay_seconds * 1000)
+            
+            # The exchange.schedule_cancel method in the SDK cancels all orders if no specific OID is given.
+            # The example basic_schedule_cancel.py uses `exchange.schedule_cancel(cancel_time)`
+            result = self.exchange.schedule_cancel(cancel_time_ms)
+            print(result)
+            self.logger.info(f"Scheduled cancellation of all orders for timestamp {cancel_time_ms}")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error scheduling cancel all orders: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def get_user_state(self):
+        """Get user state using api/examples/basic_order.py pattern"""
+        try:
+            # From api/examples/basic_order.py
+            user_state = self.info.user_state(self.address)
+            positions = []
+            for position in user_state["assetPositions"]:
+                positions.append(position["position"])
+            
+            if len(positions) > 0:
+                print("positions:")
+                for position in positions:
+                    print(json.dumps(position, indent=2))
             else:
-                taker_fee = 0.000275 if volume_14d < 500000000 else 0.00019
-                maker_fee = 0.0
-            
-            # Check for maker rebates
-            rebate = 0.0
-            if maker_percentage > 0.03:
-                rebate = self.config.rebate_tier_3
-            elif maker_percentage > 0.015:
-                rebate = self.config.rebate_tier_2
-            elif maker_percentage > 0.005:
-                rebate = self.config.rebate_tier_1
-            
-            effective_maker_fee = maker_fee + rebate  # rebate is negative
+                print("no open positions")
             
             return {
-                "volume_14d": volume_14d,
-                "maker_volume_14d": maker_volume_14d,
-                "maker_percentage": maker_percentage,
-                "taker_fee": taker_fee,
-                "maker_fee": maker_fee,
-                "rebate": rebate,
-                "effective_maker_fee": effective_maker_fee,
-                "tier": self._get_tier_name(volume_14d)
+                "positions": positions,
+                "marginSummary": user_state.get("marginSummary", {}),
+                "crossMaintenanceMarginUsed": user_state.get("crossMaintenanceMarginUsed", 0)
             }
-            
         except Exception as e:
-            self.logger.error(f"Error getting fee tier: {e}")
-            return {"error": str(e)}
-    
-    def _get_tier_name(self, volume: float) -> str:
-        """Get tier name based on volume"""
-        if volume < 5000000:
-            return "Bronze"
-        elif volume < 25000000:
-            return "Silver" 
-        elif volume < 125000000:
-            return "Gold"
-        elif volume < 500000000:
-            return "Platinum"
-        else:
-            return "Diamond"
+            self.logger.error(f"Error getting user state: {e}")
+            return {"status": "error", "message": str(e)}
 
-    async def place_maker_order(
-        self,
-        coin: str,
-        is_buy: bool,
-        sz: float,  # Use proper notation: sz = size
-        px: float,  # Use proper notation: px = price  
-        reduce_only: bool = False,
-        vault_address: str = None
-    ) -> Dict:
-        """
-        Place maker order to earn rebates - updated for actual Hyperliquid API
-        """
+    async def get_open_orders(self):
+        """Get open orders using cancel_open_orders.py pattern"""
         try:
-            # Get asset index for proper notation
-            meta_response = self.info.meta()
-            universe = meta_response.get('universe', [])
-            asset = next((i for i, c in enumerate(universe) if c['name'] == coin), None)
-            
-            if asset is None:
-                return {'status': 'error', 'message': f'Asset {coin} not found'}
-            
-            # Build order using actual Hyperliquid order structure with proper notation
-            # a=asset, b=isBuy, p=price, s=size, r=reduceOnly, t=type
-            order_request = {
-                "a": asset,
-                "b": is_buy,
-                "p": str(px),  # price as string
-                "s": str(sz),  # size as string
-                "r": reduce_only,
-                "t": {"limit": {"tif": "Alo"}}  # Add Liquidity Only
-            }
-            
-            # Place order using exchange
-            if vault_address:
-                order_result = self.exchange.order(
-                    coin, is_buy, sz, px, 
-                    {"limit": {"tif": "Alo"}},
-                    reduce_only=reduce_only,
-                    vaultAddress=vault_address
-                )
-            else:
-                order_result = self.exchange.order(
-                    coin, is_buy, sz, px,
-                    {"limit": {"tif": "Alo"}},
-                    reduce_only=reduce_only
-                )
-            
-            if order_result.get("status") == "ok":
-                # Calculate expected rebate based on current tier
-                fee_info = await self.get_current_fee_tier()
-                expected_fee = sz * px * fee_info.get("effective_maker_fee", 0)
-                
-                # Track order using proper oid (order id) notation
-                order_data = order_result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-                if "resting" in order_data:
-                    oid = order_data["resting"]["oid"]
-                    
-                    self.active_orders[oid] = {
-                        "coin": coin,
-                        "side": "buy" if is_buy else "sell",
-                        "sz": sz,    # size
-                        "px": px,    # price
-                        "timestamp": time.time(),
-                        "expected_fee": expected_fee,
-                        "vault_address": vault_address
-                    }
-                    
-                    rebate_msg = f"rebate: ${abs(expected_fee):.4f}" if expected_fee < 0 else f"fee: ${expected_fee:.4f}"
-                    self.logger.info(f"Maker order placed: {coin} {sz}@{px} ({rebate_msg})")
-            
+            # From cancel_open_orders.py
+            open_orders = self.info.open_orders(self.address)
+            return open_orders
+        except Exception as e:
+            self.logger.error(f"Error getting open orders: {e}")
+            return []
+
+    async def close_position(self, coin):
+        """Close position using basic_market_order.py pattern"""
+        try:
+            # From basic_market_order.py - market close
+            order_result = self.exchange.market_close(coin)
+            self.logger.info(f"Position closed: {coin}")
             return order_result
-            
         except Exception as e:
-            self.logger.error(f"Error placing maker order: {e}")
+            self.logger.error(f"Error closing position: {e}")
             return {"status": "error", "message": str(e)}
+
+class ProfitOptimizedTrader:
+    """
+    Profit optimization wrapper around TradingEngine
+    """
     
-    async def smart_market_order(
-        self,
-        coin: str,
-        is_buy: bool,
-        sz: float,  # Use proper notation
-        max_slippage: float = 0.005
-    ) -> Dict:
-        """
-        Smart market order that minimizes fees and slippage
-        """
-        try:
-            # Get current orderbook
-            l2_book = self.info.l2_snapshot(coin)
-            
-            if not l2_book or not l2_book.get("levels"):
-                return {"status": "error", "message": "No orderbook data"}
-            
-            bids = l2_book["levels"][0]
-            asks = l2_book["levels"][1]
-            
-            if is_buy and asks:
-                # Use proper notation: px = price
-                best_ask_px = float(asks[0]["px"])
-                limit_px = best_ask_px * (1 + max_slippage)
-            elif not is_buy and bids:
-                best_bid_px = float(bids[0]["px"])
-                limit_px = best_bid_px * (1 - max_slippage)
-            else:
-                return {"status": "error", "message": "No liquidity"}
-            
-            # Use IOC (Immediate or Cancel) with proper TIF notation
-            order_result = self.exchange.order(
-                coin, is_buy, sz, limit_px,
-                {"limit": {"tif": "Ioc"}}  # Immediate or Cancel
-            )
-            
-            return order_result
-            
-        except Exception as e:
-            self.logger.error(f"Error placing smart market order: {e}")
-            return {"status": "error", "message": str(e)}
-    
-    async def calculate_optimal_spread(self, coin: str, base_spread_bps: int = 20) -> Tuple[float, float]:
-        """
-        Calculate optimal bid/ask spread for market making
-        """
-        try:
-            # Get recent volatility using proper candle format
-            candles = self.info.candles_snapshot(coin, "1m", 60)
-            if len(candles) < 10:
-                # Fallback to base spread
-                all_mids = self.info.all_mids()
-                mid_px = float(all_mids.get(coin, 0))  # Use px notation
-                spread = mid_px * (base_spread_bps / 10000)
-                return mid_px - spread/2, mid_px + spread/2
-            
-            # Calculate volatility-adjusted spread using proper candle notation
-            # c = close price in candle format
-            prices = [float(c['c']) for c in candles]
-            volatility = self._calculate_volatility(prices)
-            
-            # Adjust spread based on volatility
-            vol_multiplier = max(1.0, min(3.0, volatility * 100))  # 1x to 3x based on volatility
-            adjusted_spread_bps = base_spread_bps * vol_multiplier
-            
-            mid_px = prices[-1]
-            spread = mid_px * (adjusted_spread_bps / 10000)
-            
-            return mid_px - spread/2, mid_px + spread/2
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating optimal spread: {e}")
-            return 0, 0
-    
-    def _calculate_volatility(self, prices: List[float]) -> float:
-        """Calculate price volatility"""
-        if len(prices) < 2:
-            return 0.01  # 1% default
+    def __init__(self, trading_engine: TradingEngine, config: TradingConfig):
+        self.engine = trading_engine
+        self.config = config
+        self.logger = logging.getLogger(__name__)
         
-        returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
-        mean_return = sum(returns) / len(returns)
-        variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
-        return variance ** 0.5
-    
-    async def profit_taking_strategy(
-        self,
-        coin: str,
-        target_profit_pct: float = 0.02,  # 2% profit target
-        stop_loss_pct: float = 0.01       # 1% stop loss
-    ) -> Dict:
-        """
-        Automated profit taking and stop loss using proper notation
-        """
+    async def smart_limit_order(self, coin: str, is_buy: bool, size: float, price: float):
+        """Place optimized limit order for maximum rebates"""
         try:
-            user_state = self.info.user_state(self.exchange.account_address)
-            positions = user_state.get("assetPositions", [])
+            # Always use Alo (Add Liquidity Only) for maker rebates
+            result = await self.engine.place_limit_order(coin, is_buy, size, price)
             
-            for asset_pos in positions:
-                position = asset_pos["position"]
-                if position["coin"] != coin or float(position["szi"]) == 0:  # szi = signed size
+            if result.get("status") == "ok":
+                # Query order status by oid like basic_order.py
+                status = result["response"]["data"]["statuses"][0]
+                if "resting" in status:
+                    order_status = self.engine.info.query_order_by_oid(
+                        self.engine.address, status["resting"]["oid"]
+                    )
+                    self.logger.info(f"Order status by oid: {order_status}")
+                    
+            return result
+        except Exception as e:
+            self.logger.error(f"Error in smart limit order: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def profit_taking_strategy(self, coin: str, target_profit_pct: float = 0.02):
+        """Profit taking using market close from basic_market_order.py"""
+        try:
+            user_state = await self.engine.get_user_state()
+            
+            for position in user_state.get("positions", []):
+                if position["coin"] != coin or float(position["szi"]) == 0:
                     continue
                 
-                szi = float(position["szi"])  # Use proper notation
-                entry_px = float(position["entryPx"])  # entryPx = entry price
+                szi = float(position["szi"])
+                entry_px = float(position["entryPx"])
                 
-                # Get current mid price
-                all_mids = self.info.all_mids()
+                # Get current price
+                all_mids = self.engine.info.all_mids()
                 current_px = float(all_mids.get(coin, entry_px))
                 
                 # Calculate P&L
-                if szi > 0:  # Long position (positive signed size)
+                if szi > 0:  # Long position
                     pnl_pct = (current_px - entry_px) / entry_px
-                    
-                    if pnl_pct >= target_profit_pct:
-                        # Take profit - close long position (sell)
-                        result = await self.smart_market_order(coin, False, abs(szi))
-                        self.logger.info(f"Profit taken on {coin}: {pnl_pct:.2%}")
-                        return {"action": "profit_taken", "pnl_pct": pnl_pct, "result": result}
-                    
-                    elif pnl_pct <= -stop_loss_pct:
-                        # Stop loss - close long position (sell)
-                        result = await self.smart_market_order(coin, False, abs(szi))
-                        self.logger.info(f"Stop loss triggered on {coin}: {pnl_pct:.2%}")
-                        return {"action": "stop_loss", "pnl_pct": pnl_pct, "result": result}
-                
-                else:  # Short position (negative signed size)
+                elif szi < 0:  # Short position
                     pnl_pct = (entry_px - current_px) / entry_px
-                    
-                    if pnl_pct >= target_profit_pct:
-                        # Take profit - close short position (buy)
-                        result = await self.smart_market_order(coin, True, abs(szi))
-                        self.logger.info(f"Profit taken on {coin}: {pnl_pct:.2%}")
-                        return {"action": "profit_taken", "pnl_pct": pnl_pct, "result": result}
-                    
-                    elif pnl_pct <= -stop_loss_pct:
-                        # Stop loss - close short position (buy)
-                        result = await self.smart_market_order(coin, True, abs(szi))
-                        self.logger.info(f"Stop loss triggered on {coin}: {pnl_pct:.2%}")
-                        return {"action": "stop_loss", "pnl_pct": pnl_pct, "result": result}
+                else:
+                    continue
+                
+                if pnl_pct >= target_profit_pct:
+                    # Close position using market_close
+                    result = await self.engine.close_position(coin)
+                    self.logger.info(f"Profit taken on {coin}: {pnl_pct:.2%}")
+                    return {"action": "profit_taken", "pnl_pct": pnl_pct, "result": result}
             
-            return {"action": "monitoring", "message": "No action needed"}
+            return {"action": "monitoring", "message": "No profit taking needed"}
             
         except Exception as e:
-            self.logger.error(f"Error in profit taking strategy: {e}")
+            self.logger.error(f"Error in profit taking: {e}")
             return {"action": "error", "message": str(e)}
-    
+
     async def track_performance(self) -> Dict:
-        """
-        Track trading performance with actual Hyperliquid data using proper notation
-        """
+        """Track performance using user_state from basic_order.py"""
         try:
-            user_state = self.info.user_state(self.exchange.account_address)
-            account_value = float(user_state.get("marginSummary", {}).get("accountValue", 0))
+            user_state = await self.engine.get_user_state()
+            margin_summary = user_state.get("marginSummary", {})
             
-            # Get recent fills for accurate profit calculation
-            recent_fills = self.info.user_fills(self.exchange.account_address)
+            account_value = float(margin_summary.get("accountValue", 0))
+            total_ntl_pos = float(margin_summary.get("totalNtlPos", 0))
+            total_raw_usd = float(margin_summary.get("totalRawUsd", 0))
+            
+            # Get recent fills for detailed tracking
+            recent_fills = self.engine.info.user_fills(self.engine.address)
             
             total_pnl = 0
-            total_fees_paid = 0
-            total_rebates_earned = 0
-            trade_count = 0
-            volume_14d = 0
-            maker_volume_14d = 0
+            total_fees = 0
+            trade_count = len(recent_fills)
             
-            # Process fills using proper notation
             for fill in recent_fills:
-                pnl = float(fill.get("closedPnl", 0))
-                fee = float(fill.get("fee", 0))
-                # Use proper notation: px=price, sz=size
-                notional = float(fill.get("px", 0)) * float(fill.get("sz", 0))
-                
-                total_pnl += pnl
-                trade_count += 1
-                
-                # Track fees vs rebates
-                if fee < 0:
-                    total_rebates_earned += abs(fee)
-                else:
-                    total_fees_paid += fee
-                
-                # Track volume (last 14 days would need timestamp filtering)
-                volume_14d += notional
-                
-                # Maker orders have negative fees
-                if fee <= 0:
-                    maker_volume_14d += notional
-            
-            # Update user stats
-            self.user_stats["14d_volume"] = volume_14d
-            self.user_stats["14d_maker_volume"] = maker_volume_14d
-            
-            net_profit = total_pnl + total_rebates_earned - total_fees_paid
-            maker_percentage = maker_volume_14d / volume_14d if volume_14d > 0 else 0
+                total_pnl += float(fill.get("closedPnl", 0))
+                total_fees += float(fill.get("fee", 0))
             
             return {
                 "account_value": account_value,
+                "total_ntl_pos": total_ntl_pos,
+                "total_raw_usd": total_raw_usd,
                 "total_pnl": total_pnl,
-                "total_fees_paid": total_fees_paid,
-                "total_rebates_earned": total_rebates_earned,
-                "net_profit": net_profit,
+                "total_fees": total_fees,
                 "trade_count": trade_count,
-                "volume_14d": volume_14d,
-                "maker_volume_14d": maker_volume_14d,
-                "maker_percentage": maker_percentage,
-                "avg_profit_per_trade": net_profit / trade_count if trade_count > 0 else 0,
-                "fee_efficiency": total_rebates_earned / (total_fees_paid + total_rebates_earned) if (total_fees_paid + total_rebates_earned) > 0 else 0,
-                "current_tier": await self.get_current_fee_tier()
+                "net_profit": total_pnl - total_fees,
+                "positions": user_state.get("positions", [])
             }
             
         except Exception as e:
             self.logger.error(f"Error tracking performance: {e}")
             return {"error": str(e)}
-
-    async def optimize_for_rebates(self, coin: str, target_volume: float) -> Dict:
-        """
-        Optimize trading strategy to maximize maker rebates
-        """
-        try:
-            fee_info = await self.get_current_fee_tier()
-            current_maker_pct = fee_info.get("maker_percentage", 0)
-            
-            # Calculate required maker volume for next rebate tier
-            total_volume = fee_info.get("volume_14d", 0)
-            required_maker_volume_tier1 = total_volume * 0.005  # 0.5%
-            required_maker_volume_tier2 = total_volume * 0.015  # 1.5%
-            required_maker_volume_tier3 = total_volume * 0.03   # 3%
-            
-            current_maker_volume = fee_info.get("maker_volume_14d", 0)
-            
-            recommendations = []
-            
-            if current_maker_pct < 0.005:
-                needed = required_maker_volume_tier1 - current_maker_volume
-                recommendations.append(f"Need ${needed:,.0f} more maker volume for -0.001% rebate")
-            elif current_maker_pct < 0.015:
-                needed = required_maker_volume_tier2 - current_maker_volume
-                recommendations.append(f"Need ${needed:,.0f} more maker volume for -0.002% rebate")
-            elif current_maker_pct < 0.03:
-                needed = required_maker_volume_tier3 - current_maker_volume
-                recommendations.append(f"Need ${needed:,.0f} more maker volume for -0.003% rebate")
-            else:
-                recommendations.append("Maximum rebate tier achieved!")
-            
-            return {
-                "status": "success",
-                "current_stats": fee_info,
-                "recommendations": recommendations,
-                "strategy": "Focus on maker-only orders with tight spreads"
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error optimizing for rebates: {e}")
-            return {"status": "error", "message": str(e)}

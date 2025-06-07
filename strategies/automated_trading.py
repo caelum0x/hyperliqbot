@@ -1,542 +1,421 @@
+"""
+Automated Trading Engine for Hyperliquid
+Implements various automated trading strategies with real market analysis
+"""
+
 import asyncio
-import time
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass
-import json
+from datetime import datetime, timedelta
+import numpy as np
+import sys
+import os
+
+# Real Hyperliquid imports
+from hyperliquid.info import Info
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils import constants
+
+# Import actual examples for real patterns
+examples_dir = os.path.join(os.path.dirname(__file__), '..', 'examples')
+sys.path.append(examples_dir)
+
+import basic_order
+import basic_tpsl
+import example_utils
+
+logger = logging.getLogger(__name__)
 
 @dataclass
-class StrategyConfig:
-    """Configuration for trading strategies"""
-    name: str
-    enabled: bool = True
-    max_position_size: float = 1000  # USD
-    profit_target: float = 0.02  # 2%
-    stop_loss: float = 0.01  # 1%
-    max_daily_trades: int = 50
-    maker_only: bool = True  # Use maker orders for rebates
-    
-@dataclass
-class TradeSignal:
-    """Trading signal data"""
-    coin: str
-    action: str  # "buy", "sell", "hold"
-    confidence: float  # 0-1
+class RealTradingSignal:
+    """Real trading signal data structure based on actual market data"""
+    symbol: str
+    action: str  # 'buy', 'sell', 'hold'
+    confidence: float
     price: float
     size: float
-    reason: str
+    timestamp: datetime
+    strategy: str
+    market_data: Dict  # Real market metrics
+    reasoning: str
 
-class ProfitMaximizingStrategies:
+class AutomatedTrading:
     """
-    Collection of automated trading strategies optimized for profit
+    Automated trading using actual Hyperliquid API patterns
+    Uses real examples: basic_order.py and basic_tpsl.py
     """
     
-    def __init__(self, trader, config: Dict):
-        self.trader = trader
-        self.config = config
+    def __init__(self, exchange: Exchange = None, info: Info = None, base_url: str = None):
+        if exchange and info:
+            self.exchange = exchange
+            self.info = info
+            self.address = exchange.account_address
+        else:
+            # Use example_utils.setup like all real examples
+            self.address, self.info, self.exchange = example_utils.setup(
+                base_url=base_url or constants.TESTNET_API_URL,
+                skip_ws=True
+            )
+        
         self.active_strategies = {}
-        self.trade_history = []
-        self.logger = logging.getLogger(__name__)
+        self.signals = []
+        self.running = False
+        self.price_history = {}
+        self.market_cache = {}
         
-    async def dca_strategy(self, coin: str, amount: float, interval_hours: int = 4) -> Dict:
-        """
-        Dollar Cost Averaging strategy with maker rebates
-        """
-        try:
-            strategy_id = f"dca_{coin}_{int(time.time())}"
-            
-            # Get current price for reference
-            current_price = (await self.trader.info.all_mids()).get(coin, 0)
-            
-            # Calculate order placement below market for maker rebates
-            buy_price = current_price * 0.9995  # 0.05% below market
-            
-            # Place maker buy order
-            result = await self.trader.place_maker_order(
-                coin=coin,
-                is_buy=True,
-                size=amount / buy_price,
-                price=buy_price
-            )
-            
-            if result.get("status") == "ok":
-                self.active_strategies[strategy_id] = {
-                    "type": "dca",
-                    "coin": coin,
-                    "amount": amount,
-                    "interval_hours": interval_hours,
-                    "last_order": time.time(),
-                    "total_invested": amount,
-                    "orders_placed": 1,
-                    "expected_rebate": amount * 0.0002  # 0.02% rebate
-                }
-                
-                return {
-                    "status": "success",
-                    "strategy_id": strategy_id,
-                    "message": f"DCA strategy started for {coin}",
-                    "next_order_in": f"{interval_hours} hours",
-                    "expected_rebate": f"${amount * 0.0002:.4f}"
-                }
-        
-        except Exception as e:
-            self.logger.error(f"DCA strategy error: {e}")
-            return {"status": "error", "message": str(e)}
-    
-    async def grid_trading_strategy(
-        self, 
-        coin: str, 
-        base_price: float, 
-        grid_spacing: float = 0.005,  # 0.5%
-        grid_levels: int = 10,
-        order_size: float = 100
-    ) -> Dict:
-        """
-        Grid trading strategy for market making profits
-        """
-        try:
-            strategy_id = f"grid_{coin}_{int(time.time())}"
-            orders_placed = []
-            
-            # Calculate grid levels
-            for i in range(-grid_levels//2, grid_levels//2 + 1):
-                if i == 0:
-                    continue  # Skip center price
-                
-                grid_price = base_price * (1 + i * grid_spacing)
-                is_buy = i < 0  # Buy orders below, sell orders above
-                
-                # Place maker order
-                result = await self.trader.place_maker_order(
-                    coin=coin,
-                    is_buy=is_buy,
-                    size=order_size / grid_price,
-                    price=grid_price
-                )
-                
-                if result.get("status") == "ok":
-                    orders_placed.append({
-                        "price": grid_price,
-                        "side": "buy" if is_buy else "sell",
-                        "size": order_size / grid_price,
-                        "expected_rebate": (order_size / grid_price) * grid_price * 0.0002
-                    })
-            
-            if orders_placed:
-                total_rebate_potential = sum(order["expected_rebate"] for order in orders_placed)
-                
-                self.active_strategies[strategy_id] = {
-                    "type": "grid",
-                    "coin": coin,
-                    "base_price": base_price,
-                    "grid_spacing": grid_spacing,
-                    "orders": orders_placed,
-                    "total_orders": len(orders_placed),
-                    "rebate_potential": total_rebate_potential
-                }
-                
-                return {
-                    "status": "success",
-                    "strategy_id": strategy_id,
-                    "orders_placed": len(orders_placed),
-                    "total_rebate_potential": f"${total_rebate_potential:.4f}",
-                    "price_range": f"${min(o['price'] for o in orders_placed):.2f} - ${max(o['price'] for o in orders_placed):.2f}"
-                }
-        
-        except Exception as e:
-            self.logger.error(f"Grid strategy error: {e}")
-            return {"status": "error", "message": str(e)}
-    
-    async def momentum_scalping(
-        self,
-        coin: str,
-        momentum_threshold: float = 0.002,  # 0.2% price movement
-        profit_target: float = 0.001,  # 0.1% profit
-        max_hold_time: int = 300  # 5 minutes
-    ) -> Dict:
-        """
-        Momentum scalping strategy
-        """
-        try:
-            # Get recent price data
-            candles = await self.trader.info.candles_snapshot(coin, "1m", 10)
-            if len(candles) < 5:
-                return {"status": "error", "message": "Insufficient price data"}
-            
-            # Calculate momentum
-            recent_prices = [float(c['c']) for c in candles[-5:]]
-            price_change = (recent_prices[-1] - recent_prices[0]) / recent_prices[0]
-            
-            if abs(price_change) < momentum_threshold:
-                return {"status": "no_signal", "message": "No momentum detected"}
-            
-            # Determine trade direction
-            is_buy = price_change > 0
-            current_price = recent_prices[-1]
-            
-            # Calculate entry and exit prices
-            if is_buy:
-                entry_price = current_price * 0.9998  # Slightly below market
-                exit_price = entry_price * (1 + profit_target)
-            else:
-                entry_price = current_price * 1.0002  # Slightly above market  
-                exit_price = entry_price * (1 - profit_target)
-            
-            # Place entry order
-            entry_result = await self.trader.place_maker_order(
-                coin=coin,
-                is_buy=is_buy,
-                size=100 / entry_price,  # $100 position
-                price=entry_price
-            )
-            
-            if entry_result.get("status") == "ok":
-                strategy_id = f"scalp_{coin}_{int(time.time())}"
-                
-                self.active_strategies[strategy_id] = {
-                    "type": "scalping",
-                    "coin": coin,
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "is_buy": is_buy,
-                    "entry_time": time.time(),
-                    "max_hold_time": max_hold_time,
-                    "profit_target": profit_target
-                }
-                
-                return {
-                    "status": "success",
-                    "strategy_id": strategy_id,
-                    "direction": "LONG" if is_buy else "SHORT",
-                    "entry_price": f"${entry_price:.4f}",
-                    "target_price": f"${exit_price:.4f}",
-                    "momentum": f"{price_change*100:+.2f}%"
-                }
-        
-        except Exception as e:
-            self.logger.error(f"Scalping strategy error: {e}")
-            return {"status": "error", "message": str(e)}
-    
-    async def arbitrage_scanner(self) -> List[Dict]:
-        """
-        Scan for arbitrage opportunities between different assets
-        """
-        opportunities = []
-        
-        try:
-            # Get all available mids
-            all_mids = await self.trader.info.all_mids()
-            
-            # Look for triangular arbitrage opportunities
-            # Example: BTC -> ETH -> USDC -> BTC
-            btc_price = all_mids.get("BTC", 0)
-            eth_price = all_mids.get("ETH", 0)
-            
-            if btc_price > 0 and eth_price > 0:
-                # Calculate cross rates and look for discrepancies
-                btc_eth_rate = btc_price / eth_price
-                
-                # Check if there's an arbitrage opportunity
-                # This is simplified - real arbitrage would need orderbook depth analysis
-                theoretical_rate = 15.5  # Example theoretical BTC/ETH rate
-                rate_difference = abs(btc_eth_rate - theoretical_rate) / theoretical_rate
-                
-                if rate_difference > 0.001:  # 0.1% arbitrage opportunity
-                    opportunities.append({
-                        "type": "triangular_arbitrage",
-                        "assets": ["BTC", "ETH"],
-                        "profit_potential": f"{rate_difference*100:.2f}%",
-                        "current_rate": btc_eth_rate,
-                        "theoretical_rate": theoretical_rate,
-                        "action": "Execute arbitrage cycle"
-                    })
-        
-        except Exception as e:
-            self.logger.error(f"Arbitrage scanner error: {e}")
-        
-        return opportunities
-    
-    async def trend_following_strategy(
-        self,
-        coin: str,
-        lookback_periods: int = 20,
-        trend_threshold: float = 0.01  # 1% trend
-    ) -> Dict:
-        """
-        Trend following strategy using moving averages
-        """
-        try:
-            # Get historical data
-            candles = await self.trader.info.candles_snapshot(coin, "1h", lookback_periods + 5)
-            if len(candles) < lookback_periods:
-                return {"status": "error", "message": "Insufficient data"}
-            
-            # Calculate moving averages
-            prices = [float(c['c']) for c in candles]
-            short_ma = sum(prices[-10:]) / 10  # 10-period MA
-            long_ma = sum(prices[-20:]) / 20   # 20-period MA
-            current_price = prices[-1]
-            
-            # Determine trend
-            trend_strength = (short_ma - long_ma) / long_ma
-            
-            if abs(trend_strength) < trend_threshold:
-                return {"status": "no_signal", "message": "No clear trend"}
-            
-            # Generate signal
-            is_uptrend = trend_strength > 0
-            
-            if is_uptrend:
-                # Enter long position
-                entry_price = current_price * 0.9995
-                target_price = entry_price * 1.02  # 2% target
-                stop_price = entry_price * 0.99   # 1% stop
-            else:
-                # Enter short position
-                entry_price = current_price * 1.0005
-                target_price = entry_price * 0.98  # 2% target
-                stop_price = entry_price * 1.01   # 1% stop
-            
-            # Place entry order
-            result = await self.trader.place_maker_order(
-                coin=coin,
-                is_buy=is_uptrend,
-                size=200 / entry_price,  # $200 position
-                price=entry_price
-            )
-            
-            if result.get("status") == "ok":
-                strategy_id = f"trend_{coin}_{int(time.time())}"
-                
-                self.active_strategies[strategy_id] = {
-                    "type": "trend_following",
-                    "coin": coin,
-                    "trend_direction": "up" if is_uptrend else "down",
-                    "trend_strength": trend_strength,
-                    "entry_price": entry_price,
-                    "target_price": target_price,
-                    "stop_price": stop_price,
-                    "entry_time": time.time()
-                }
-                
-                return {
-                    "status": "success",
-                    "strategy_id": strategy_id,
-                    "trend": "UPTREND" if is_uptrend else "DOWNTREND",
-                    "strength": f"{abs(trend_strength)*100:.2f}%",
-                    "entry": f"${entry_price:.4f}",
-                    "target": f"${target_price:.4f}"
-                }
-                
-        except Exception as e:
-            self.logger.error(f"Trend following error: {e}")
-            return {"status": "error", "message": str(e)}
-    
-    async def manage_active_strategies(self) -> Dict:
-        """
-        Monitor and manage all active strategies
-        """
-        management_results = {
-            "total_strategies": len(self.active_strategies),
-            "actions_taken": [],
-            "total_profit": 0,
-            "total_rebates": 0
-        }
-        
-        try:
-            current_time = time.time()
-            
-            for strategy_id, strategy in list(self.active_strategies.items()):
-                coin = strategy["coin"]
-                strategy_type = strategy["type"]
-                
-                # Get current price
-                current_price = (await self.trader.info.all_mids()).get(coin, 0)
-                
-                if strategy_type == "scalping":
-                    # Check if position should be closed
-                    entry_time = strategy["entry_time"]
-                    max_hold_time = strategy["max_hold_time"]
-                    
-                    if current_time - entry_time > max_hold_time:
-                        # Force close position
-                        close_result = await self.trader.smart_market_order(
-                            coin=coin,
-                            is_buy=not strategy["is_buy"],  # Opposite direction
-                            size=100 / current_price  # Close position
-                        )
-                        
-                        if close_result.get("status") == "ok":
-                            profit = self._calculate_profit(strategy, current_price)
-                            management_results["actions_taken"].append({
-                                "strategy_id": strategy_id,
-                                "action": "force_close",
-                                "profit": profit
-                            })
-                            management_results["total_profit"] += profit
-                            del self.active_strategies[strategy_id]
-                
-                elif strategy_type == "trend_following":
-                    # Check stop loss and take profit
-                    entry_price = strategy["entry_price"]
-                    target_price = strategy["target_price"]
-                    stop_price = strategy["stop_price"]
-                    is_long = strategy["trend_direction"] == "up"
-                    
-                    should_close = False
-                    close_reason = ""
-                    
-                    if is_long:
-                        if current_price >= target_price:
-                            should_close = True
-                            close_reason = "take_profit"
-                        elif current_price <= stop_price:
-                            should_close = True
-                            close_reason = "stop_loss"
-                    else:
-                        if current_price <= target_price:
-                            should_close = True
-                            close_reason = "take_profit"
-                        elif current_price >= stop_price:
-                            should_close = True
-                            close_reason = "stop_loss"
-                    
-                    if should_close:
-                        close_result = await self.trader.smart_market_order(
-                            coin=coin,
-                            is_buy=not is_long,
-                            size=200 / current_price
-                        )
-                        
-                        if close_result.get("status") == "ok":
-                            profit = self._calculate_profit(strategy, current_price)
-                            management_results["actions_taken"].append({
-                                "strategy_id": strategy_id,
-                                "action": close_reason,
-                                "profit": profit
-                            })
-                            management_results["total_profit"] += profit
-                            del self.active_strategies[strategy_id]
-            
-            return management_results
-            
-        except Exception as e:
-            self.logger.error(f"Strategy management error: {e}")
-            return {"status": "error", "message": str(e)}
-    
-    def _calculate_profit(self, strategy: Dict, current_price: float) -> float:
-        """Calculate profit for a strategy"""
-        try:
-            entry_price = strategy["entry_price"]
-            
-            if strategy["type"] == "scalping":
-                is_long = strategy["is_buy"]
-                if is_long:
-                    return (current_price - entry_price) / entry_price * 100  # $100 position
-                else:
-                    return (entry_price - current_price) / entry_price * 100
-            
-            elif strategy["type"] == "trend_following":
-                is_long = strategy["trend_direction"] == "up"
-                if is_long:
-                    return (current_price - entry_price) / entry_price * 200  # $200 position
-                else:
-                    return (entry_price - current_price) / entry_price * 200
-            
-            return 0
-            
-        except Exception as e:
-            self.logger.error(f"Profit calculation error: {e}")
-            return 0
-    
-    async def get_strategy_performance(self) -> Dict:
-        """Get performance statistics for all strategies"""
-        try:
-            performance = {
-                "active_strategies": len(self.active_strategies),
-                "total_trades": len(self.trade_history),
-                "strategy_breakdown": {},
-                "profitability": {
-                    "total_profit": 0,
-                    "total_rebates": 0,
-                    "win_rate": 0,
-                    "average_trade": 0
-                }
-            }
-            
-            # Analyze trade history
-            profitable_trades = [t for t in self.trade_history if t.get("profit", 0) > 0]
-            total_profit = sum(t.get("profit", 0) for t in self.trade_history)
-            total_rebates = sum(t.get("rebate", 0) for t in self.trade_history)
-            
-            performance["profitability"] = {
-                "total_profit": total_profit,
-                "total_rebates": total_rebates,
-                "win_rate": len(profitable_trades) / max(len(self.trade_history), 1) * 100,
-                "average_trade": total_profit / max(len(self.trade_history), 1)
-            }
-            
-            # Strategy breakdown
-            for strategy_id, strategy in self.active_strategies.items():
-                strategy_type = strategy["type"]
-                if strategy_type not in performance["strategy_breakdown"]:
-                    performance["strategy_breakdown"][strategy_type] = {
-                        "count": 0,
-                        "total_capital": 0
-                    }
-                
-                performance["strategy_breakdown"][strategy_type]["count"] += 1
-                
-                # Estimate capital deployed
-                if strategy_type == "dca":
-                    performance["strategy_breakdown"][strategy_type]["total_capital"] += strategy.get("total_invested", 0)
-                elif strategy_type == "grid":
-                    performance["strategy_breakdown"][strategy_type]["total_capital"] += len(strategy.get("orders", [])) * 100
-            
-            return performance
-            
-        except Exception as e:
-            self.logger.error(f"Performance calculation error: {e}")
-            return {"status": "error", "message": str(e)}
+        logger.info("AutomatedTrading initialized with real Hyperliquid API")
 
-class RiskManager:
-    """
-    Risk management for automated strategies
-    """
-    
-    def __init__(self, max_account_risk: float = 0.02):  # 2% max account risk
-        self.max_account_risk = max_account_risk
-        self.daily_loss_limit = 0.05  # 5% daily loss limit
-        self.max_open_positions = 10
-        
-    async def check_risk_limits(self, trader, new_trade_size: float) -> Dict:
-        """Check if new trade passes risk management rules"""
+    async def momentum_strategy(self, coin: str, position_size: float = 0.1) -> Dict:
+        """
+        Momentum strategy using real market data and basic_tpsl.py patterns
+        """
         try:
-            # Get account information
-            performance = await trader.track_performance()
-            account_value = performance.get("account_value", 0)
+            # Get real market data following basic_order.py pattern
+            all_mids = self.info.all_mids()
+            if coin not in all_mids:
+                return {'status': 'error', 'message': f'No price data for {coin}'}
             
-            # Check daily loss limit
-            daily_pnl = performance.get("total_pnl", 0)  # Simplified
-            if daily_pnl < -account_value * self.daily_loss_limit:
-                return {
-                    "approved": False,
-                    "reason": "Daily loss limit exceeded",
-                    "limit": f"{self.daily_loss_limit*100}%"
+            current_price = float(all_mids[coin])
+            
+            # Get order book imbalance using real L2 data
+            l2_book = self.info.l2_snapshot(coin)
+            if not l2_book or 'levels' not in l2_book or len(l2_book['levels']) < 2:
+                return {'status': 'error', 'message': f'No L2 data for {coin}'}
+            
+            # Calculate real order book depth (top 10 levels)
+            bid_depth = sum(float(lvl['sz']) * float(lvl['px']) for lvl in l2_book['levels'][0][:10])
+            ask_depth = sum(float(lvl['sz']) * float(lvl['px']) for lvl in l2_book['levels'][1][:10])
+            
+            if bid_depth + ask_depth == 0:
+                return {'status': 'error', 'message': f'No liquidity for {coin}'}
+            
+            # Calculate imbalance ratio
+            imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth)
+            
+            logger.info(f"Market analysis for {coin}: price={current_price}, imbalance={imbalance:.3f}")
+            
+            # Generate signal based on imbalance
+            if imbalance > 0.2:  # Strong buy pressure
+                return await self._execute_momentum_buy(coin, current_price, position_size, imbalance)
+            elif imbalance < -0.2:  # Strong sell pressure
+                return await self._execute_momentum_sell(coin, current_price, position_size, imbalance)
+            else:
+                return {'status': 'neutral', 'imbalance': imbalance, 'message': 'No strong momentum signal'}
+                
+        except Exception as e:
+            logger.error(f"Error in momentum strategy for {coin}: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def _execute_momentum_buy(self, coin: str, current_price: float, size: float, imbalance: float) -> Dict:
+        """Execute momentum buy order with TP/SL using basic_tpsl.py pattern"""
+        try:
+            # Calculate entry, TP, and SL prices
+            entry_price = current_price * 1.0001  # Slightly above mid for better fill
+            tp_price = entry_price * 1.005  # 0.5% profit target
+            sl_price = entry_price * 0.998  # 0.2% stop loss
+            
+            # Place main order following basic_order.py pattern with Add Liquidity Only
+            order_result = self.exchange.order(
+                coin, True, size, entry_price,
+                {"limit": {"tif": "Alo"}},  # Add Liquidity Only for maker rebates
+                reduce_only=False
+            )
+            print(order_result)  # Print like basic_order.py
+            
+            if order_result.get('status') != 'ok':
+                return {'status': 'error', 'message': f'Failed to place entry order: {order_result}'}
+            
+            # Get order ID for tracking
+            status = order_result["response"]["data"]["statuses"][0]
+            if "resting" not in status:
+                return {'status': 'error', 'message': 'Entry order did not rest on book'}
+            
+            entry_oid = status["resting"]["oid"]
+            
+            # Query order status like basic_order.py
+            order_status = self.info.query_order_by_oid(self.address, entry_oid)
+            print("Entry order status by oid:", order_status)
+            
+            # Place Take Profit order following basic_tpsl.py pattern
+            tp_result = self.exchange.order(
+                coin, False, size, tp_price,
+                {
+                    "limit": {"tif": "Gtc"},
+                    "tpsl": [{
+                        "trigger": {"px": tp_price, "isMarket": True, "sz": size},
+                        "condition": "tp"
+                    }]
+                },
+                reduce_only=True
+            )
+            print("TP order result:", tp_result)
+            
+            # Place Stop Loss order following basic_tpsl.py pattern
+            sl_result = self.exchange.order(
+                coin, False, size, sl_price,
+                {
+                    "limit": {"tif": "Gtc"},
+                    "tpsl": [{
+                        "trigger": {"px": sl_price, "isMarket": True, "sz": size},
+                        "condition": "sl"
+                    }]
+                },
+                reduce_only=True
+            )
+            print("SL order result:", sl_result)
+            
+            return {
+                'status': 'success',
+                'action': 'momentum_buy',
+                'coin': coin,
+                'entry_price': entry_price,
+                'tp_price': tp_price,
+                'sl_price': sl_price,
+                'size': size,
+                'imbalance': imbalance,
+                'entry_oid': entry_oid,
+                'orders': {
+                    'entry': order_result,
+                    'take_profit': tp_result,
+                    'stop_loss': sl_result
                 }
-            
-            # Check position size limit
-            max_position_size = account_value * self.max_account_risk
-            if new_trade_size > max_position_size:
-                return {
-                    "approved": False,
-                    "reason": "Position size too large",
-                    "max_size": max_position_size,
-                    "requested": new_trade_size
-                }
-            
-            return {"approved": True, "message": "Risk checks passed"}
+            }
             
         except Exception as e:
-            return {"approved": False, "reason": f"Risk check error: {str(e)}"}
+            logger.error(f"Error executing momentum buy: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def _execute_momentum_sell(self, coin: str, current_price: float, size: float, imbalance: float) -> Dict:
+        """Execute momentum sell order with TP/SL using basic_tpsl.py pattern"""
+        try:
+            # Calculate entry, TP, and SL prices for short position
+            entry_price = current_price * 0.9999  # Slightly below mid for better fill
+            tp_price = entry_price * 0.995  # 0.5% profit target (price goes down)
+            sl_price = entry_price * 1.002  # 0.2% stop loss (price goes up)
+            
+            # Place main short order following basic_order.py pattern
+            order_result = self.exchange.order(
+                coin, False, size, entry_price,
+                {"limit": {"tif": "Alo"}},  # Add Liquidity Only for maker rebates
+                reduce_only=False
+            )
+            print(order_result)  # Print like basic_order.py
+            
+            if order_result.get('status') != 'ok':
+                return {'status': 'error', 'message': f'Failed to place entry order: {order_result}'}
+            
+            # Get order ID for tracking
+            status = order_result["response"]["data"]["statuses"][0]
+            if "resting" not in status:
+                return {'status': 'error', 'message': 'Entry order did not rest on book'}
+            
+            entry_oid = status["resting"]["oid"]
+            
+            # Query order status like basic_order.py
+            order_status = self.info.query_order_by_oid(self.address, entry_oid)
+            print("Entry order status by oid:", order_status)
+            
+            # Place Take Profit order (buy back at lower price)
+            tp_result = self.exchange.order(
+                coin, True, size, tp_price,
+                {
+                    "limit": {"tif": "Gtc"},
+                    "tpsl": [{
+                        "trigger": {"px": tp_price, "isMarket": True, "sz": size},
+                        "condition": "tp"
+                    }]
+                },
+                reduce_only=True
+            )
+            print("TP order result:", tp_result)
+            
+            # Place Stop Loss order (buy back at higher price)
+            sl_result = self.exchange.order(
+                coin, True, size, sl_price,
+                {
+                    "limit": {"tif": "Gtc"},
+                    "tpsl": [{
+                        "trigger": {"px": sl_price, "isMarket": True, "sz": size},
+                        "condition": "sl"
+                    }]
+                },
+                reduce_only=True
+            )
+            print("SL order result:", sl_result)
+            
+            return {
+                'status': 'success',
+                'action': 'momentum_sell',
+                'coin': coin,
+                'entry_price': entry_price,
+                'tp_price': tp_price,
+                'sl_price': sl_price,
+                'size': size,
+                'imbalance': imbalance,
+                'entry_oid': entry_oid,
+                'orders': {
+                    'entry': order_result,
+                    'take_profit': tp_result,
+                    'stop_loss': sl_result
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error executing momentum sell: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def scalping_strategy(self, coin: str, target_spread_bps: float = 5.0) -> Dict:
+        """
+        Scalping strategy targeting tight spreads for quick profits
+        """
+        try:
+            # Get real L2 data
+            l2_book = self.info.l2_snapshot(coin)
+            if not l2_book or 'levels' not in l2_book or len(l2_book['levels']) < 2:
+                return {'status': 'error', 'message': f'No L2 data for {coin}'}
+            
+            # Get best bid/ask
+            best_bid = float(l2_book['levels'][0][0]['px'])
+            best_ask = float(l2_book['levels'][1][0]['px'])
+            mid_price = (best_bid + best_ask) / 2
+            spread_bps = ((best_ask - best_bid) / mid_price) * 10000
+            
+            logger.info(f"Scalping analysis for {coin}: spread={spread_bps:.1f}bps, target={target_spread_bps}bps")
+            
+            # Only scalp when spread is tight enough
+            if spread_bps > target_spread_bps:
+                return {
+                    'status': 'wait',
+                    'message': f'Spread too wide: {spread_bps:.1f}bps > {target_spread_bps}bps'
+                }
+            
+            # Place both bid and ask orders for market making
+            bid_price = best_bid + 0.01  # One tick above best bid
+            ask_price = best_ask - 0.01  # One tick below best ask
+            size = 0.05  # Small size for scalping
+            
+            # Place bid order (buy)
+            bid_result = self.exchange.order(
+                coin, True, size, bid_price,
+                {"limit": {"tif": "Alo"}},  # Add Liquidity Only
+                reduce_only=False
+            )
+            print("Bid order result:", bid_result)
+            
+            # Place ask order (sell)
+            ask_result = self.exchange.order(
+                coin, False, size, ask_price,
+                {"limit": {"tif": "Alo"}},  # Add Liquidity Only
+                reduce_only=False
+            )
+            print("Ask order result:", ask_result)
+            
+            return {
+                'status': 'success',
+                'strategy': 'scalping',
+                'coin': coin,
+                'spread_bps': spread_bps,
+                'bid_price': bid_price,
+                'ask_price': ask_price,
+                'size': size,
+                'orders': {
+                    'bid': bid_result,
+                    'ask': ask_result
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in scalping strategy for {coin}: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def dca_strategy(self, coin: str, usd_amount: float = 100) -> Dict:
+        """
+        Dollar Cost Averaging strategy using real market data
+        """
+        try:
+            # Get current price
+            all_mids = self.info.all_mids()
+            if coin not in all_mids:
+                return {'status': 'error', 'message': f'No price data for {coin}'}
+            
+            current_price = float(all_mids[coin])
+            size = usd_amount / current_price
+            
+            # Place DCA buy order slightly above mid for better fill probability
+            entry_price = current_price * 1.0005
+            
+            # Use basic_order.py pattern for DCA execution
+            order_result = self.exchange.order(
+                coin, True, size, entry_price,
+                {"limit": {"tif": "Gtc"}},  # Good Till Cancel
+                reduce_only=False
+            )
+            print(order_result)  # Print like basic_order.py
+            
+            if order_result.get('status') == 'ok':
+                status = order_result["response"]["data"]["statuses"][0]
+                if "resting" in status:
+                    order_status = self.info.query_order_by_oid(self.address, status["resting"]["oid"])
+                    print("DCA order status by oid:", order_status)
+            
+            return {
+                'status': 'success',
+                'strategy': 'dca',
+                'coin': coin,
+                'usd_amount': usd_amount,
+                'current_price': current_price,
+                'entry_price': entry_price,
+                'size': size,
+                'order_result': order_result
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in DCA strategy for {coin}: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def get_strategy_performance(self, strategy_id: str) -> Dict:
+        """Get performance metrics for a strategy"""
+        try:
+            # Get user fills for performance tracking
+            user_fills = self.info.user_fills(self.address)
+            
+            # Calculate performance metrics
+            total_pnl = sum(float(fill.get('closedPnl', 0)) for fill in user_fills)
+            total_fees = sum(float(fill.get('fee', 0)) for fill in user_fills)
+            net_pnl = total_pnl - total_fees
+            
+            return {
+                'strategy_id': strategy_id,
+                'total_pnl': total_pnl,
+                'total_fees': total_fees,
+                'net_pnl': net_pnl,
+                'fill_count': len(user_fills),
+                'performance': 'profitable' if net_pnl > 0 else 'unprofitable'
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting strategy performance: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+# ...existing RealAutomatedTradingEngine code for compatibility...
+
+# Legacy class alias for compatibility
+class RealAutomatedTradingEngine(AutomatedTrading):
+    """Legacy alias pointing to real implementation"""
+    pass
+
+# Helper functions to run examples directly
+def run_basic_order_example():
+    """Run the basic_order.py example directly"""
+    try:
+        basic_order.main()
+    except Exception as e:
+        print(f"Error running basic_order example: {e}")
+
+def run_basic_tpsl_example():
+    """Run the basic_tpsl.py example directly"""
+    try:
+        basic_tpsl.main()
+    except Exception as e:
+        print(f"Error running basic_tpsl example: {e}")

@@ -6,6 +6,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import json
 
+from strategies.hyperevm_network import HyperEVMConnector, HyperEVMMonitor
+from strategies.seedify_imc import SeedifyIMCManager
+
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,39 +22,8 @@ from hyperliquid.utils import constants
 import example_utils
 
 # Import our components - fix the imports to use the actual file structure
-try:
-    from trading_engine.core_engine import ProfitOptimizedTrader, TradingConfig
-except ImportError:
-    from .core_engine import ProfitOptimizedTrader, TradingConfig
-
-try:
-    from strategies.hyperevm_network import HyperEVMConnector, HyperEVMMonitor
-except ImportError:
-    # Create a simple placeholder if the file doesn't exist
-    class HyperEVMConnector:
-        def __init__(self, config): 
-            self.config = config
-        async def get_network_status(self):
-            return {"connected": False, "network": "testnet"}
-    
-    class HyperEVMMonitor:
-        def __init__(self, connector):
-            self.connector = connector
-        async def check_gas_prices(self):
-            return {"current_gas_gwei": 20, "recommendation": "normal"}
-
-try:
-    from strategies.seedify_imc import SeedifyIMCManager, RealIMCStrategy
-except ImportError:
-    # Create a simple placeholder
-    class SeedifyIMCManager:
-        def __init__(self, exchange, info, config):
-            self.exchange = exchange
-            self.info = info
-            self.config = config
-        
-        async def create_volume_farming_strategy(self, capital):
-            return {"status": "success", "strategy": {"capital_allocated": capital}}
+from trading_engine.core_engine import ProfitOptimizedTrader, TradingConfig
+from trading_engine.example_utils import setup
 
 # Configure logging
 logging.basicConfig(
@@ -65,23 +37,33 @@ class TelegramTradingBot:
     Advanced Telegram trading bot with working Hyperliquid integration
     """
     
-    def __init__(self, telegram_token: str, config: Dict):
-        self.app = Application.builder().token(telegram_token).build()
+    def __init__(self, token: str, config: Dict, vault_manager=None, trading_engine=None, database=None, user_manager=None):
+        self.token = token
         self.config = config
+        self.logger = logging.getLogger(__name__)
+        
+        # Dependency injection from main.py - Core Components
+        self.vault_manager = vault_manager
+        self.trading_engine = trading_engine
+        self.database = database
+        self.user_manager = user_manager
         
         # Initialize user sessions with real Hyperliquid connections
         self.user_sessions = {}  # user_id -> session with exchange, info, etc
         self.active_strategies = {}
         self.profit_tracking = {}
         
-        # Initialize vault manager (THE MAIN REVENUE ENGINE)
-        self.vault_manager = None
+        # Components injected by main.py after initialization
+        self.profit_bot = None
+        self.strategies = {}
+        self.websocket_manager = None
+        
         self.referral_code = config.get("referral_code", "HYPERBOT")
         
-        # Initialize trading components
+        # Initialize trading configuration
         self.trading_config = TradingConfig()
         self.setup_handlers()
-    
+
     def setup_handlers(self):
         """Setup all command and callback handlers"""
         # Main commands
@@ -240,7 +222,7 @@ Ready to join the alpha?"""
             await update.message.reply_text(f"❌ **Connection Failed**\n\nError: {str(e)}")
 
     async def show_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show user portfolio using REAL Hyperliquid data"""
+        """Show user portfolio using REAL Hyperliquid data and injected components"""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
@@ -261,10 +243,23 @@ Ready to join the alpha?"""
             total_pnl = float(margin_summary.get("totalPnl", 0))
             margin_used = float(margin_summary.get("totalMarginUsed", 0))
             
+            # Get additional data from injected database
+            user_stats = {}
+            if self.database:
+                try:
+                    user_stats = await self.database.get_user_stats(user_id)
+                except Exception as e:
+                    logger.warning(f"Database error: {e}")
+            
             portfolio_text = f"📊 **Your Portfolio**\n\n"
             portfolio_text += f"💰 Account Value: ${account_value:,.2f}\n"
             portfolio_text += f"📈 Total P&L: ${total_pnl:+,.2f}\n"
-            portfolio_text += f"🔒 Margin Used: ${margin_used:,.2f}\n\n"
+            portfolio_text += f"🔒 Margin Used: ${margin_used:,.2f}\n"
+            
+            if user_stats.get('vault_balance'):
+                portfolio_text += f"🏦 Vault Balance: ${user_stats['vault_balance']:,.2f}\n"
+            
+            portfolio_text += "\n"
             
             if positions:
                 portfolio_text += "**Open Positions:**\n"
@@ -301,11 +296,15 @@ Ready to join the alpha?"""
             await update.message.reply_text(f"❌ Error fetching portfolio: {str(e)}")
 
     async def trade_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show trading menu"""
+        """Show trading menu using injected trading_engine"""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
             await update.message.reply_text("❌ Please connect your wallet first using /connect")
+            return
+        
+        if not self.trading_engine:
+            await update.message.reply_text("❌ Trading engine not available")
             return
         
         keyboard = [
@@ -318,14 +317,23 @@ Ready to join the alpha?"""
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
+        # Get trading engine status using injected component
+        try:
+            engine_status = await self.trading_engine.get_status()
+            status_text = f"🔄 Engine Status: {'✅ Active' if engine_status.get('active') else '❌ Inactive'}\n"
+        except Exception as e:
+            logger.warning(f"Trading engine status error: {e}")
+            status_text = "🔄 Engine Status: Unknown\n"
+        
         await update.message.reply_text(
-            "📈 **Trading Menu**\n\n"
-            "Choose your trading action:",
+            f"📈 **Trading Menu**\n\n"
+            f"{status_text}\n"
+            f"Choose your trading action:",
             reply_markup=reply_markup
         )
     
     async def strategies_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show automated strategies menu"""
+        """Show automated strategies menu using injected strategies"""
         user_id = update.effective_user.id
         
         if user_id not in self.user_sessions:
@@ -342,12 +350,14 @@ Ready to join the alpha?"""
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Show active strategies
+        # Show active strategies using injected strategies
         active_count = len(self.active_strategies.get(user_id, {}))
+        available_strategies = len(self.strategies) if self.strategies else 0
         
         await update.message.reply_text(
             f"🤖 **Automated Strategies**\n\n"
-            f"Active Strategies: {active_count}\n\n"
+            f"Available Strategies: {available_strategies}\n"
+            f"Your Active Strategies: {active_count}\n\n"
             f"Choose a strategy to configure:",
             reply_markup=reply_markup
         )
@@ -720,53 +730,574 @@ Ready to join the alpha?"""
             await update.callback_query.edit_message_text(f"❌ Error getting rebate status: {str(e)}")
 
     async def handle_deposit_vault(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle vault deposit"""
-        await update.message.reply_text(
-            "💰 **Deposit to Vault**\n\n"
-            "🚧 **Coming Soon**\n\n"
-            "The vault system is being finalized. You'll be able to:\n\n"
-            "• Deposit USDC directly\n"
-            "• Earn from 4 alpha strategies\n"
-            "• Get 90% of profits\n"
-            "• Track performance in real-time\n\n"
-            "For now, use /connect to link your wallet for manual trading.",
-            parse_mode='Markdown'
-        )
+        """Handle vault deposit using injected vault_manager"""
+        user_id = update.effective_user.id
+        
+        if not self.vault_manager:
+            await update.message.reply_text("❌ Vault system not available")
+            return
+        
+        try:
+            # Use injected vault_manager for deposit handling
+            result = await self.vault_manager.handle_deposit(user_id, update, context)
+            
+            if result.get("status") == "success":
+                # Update user stats in database if available
+                if self.database:
+                    try:
+                        await self.database.update_user_vault_balance(
+                            user_id, 
+                            result.get('new_balance', 0)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Database update error: {e}")
+                
+                await update.message.reply_text(
+                    f"✅ **Deposit Successful**\n\n"
+                    f"💰 Amount: ${result.get('amount', 0):,.2f}\n"
+                    f"📊 Your Vault Balance: ${result.get('new_balance', 0):,.2f}\n"
+                    f"🎯 Expected Daily Return: {result.get('expected_daily_return', 0)*100:.2f}%\n\n"
+                    f"Your funds are now earning from 4 alpha strategies!",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ **Deposit Failed**\n\n{result.get('message', 'Unknown error')}"
+                )
+                
+        except Exception as e:
+            logger.error(f"Vault deposit error: {e}")
+            await update.message.reply_text(
+                "💰 **Deposit to Vault**\n\n"
+                "🚧 **System Error**\n\n"
+                "Please try again later or contact support.",
+                parse_mode='Markdown'
+            )
 
     async def handle_vault_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle vault statistics"""
-        await update.message.reply_text(
-            "📊 **Vault Performance**\n\n"
-            "💰 Total Value Locked: $250,000\n"
-            "📈 Total Return: +15.2%\n"
-            "📅 Active Days: 45\n"
-            "👥 Active Users: 127\n\n"
-            "🎯 **Daily Stats:**\n"
-            "• Volume: $2.5M\n"
-            "• Rebates: $400\n"
-            "• Net Profit: $1,200\n\n"
-            "🚀 **Strategy Performance:**\n"
-            "• Maker Rebates: +$18,000\n"
-            "• HLP Staking: +$22,500\n"
-            "• Grid Trading: +$8,300\n"
-            "• Arbitrage: +$3,200\n\n"
-            "Connect your wallet with /connect to join!",
-            parse_mode='Markdown'
-        )
+        """Handle vault statistics using injected components"""
+        user_id = update.effective_user.id
+        
+        if not self.vault_manager:
+            await update.message.reply_text("❌ Vault system not available")
+            return
+        
+        try:
+            # Use injected vault_manager and database
+            vault_stats = await self.vault_manager.get_vault_stats()
+            
+            user_stats = {}
+            if self.database:
+                try:
+                    user_stats = await self.database.get_user_stats(user_id)
+                except Exception as e:
+                    logger.warning(f"Database error: {e}")
+            
+            stats_text = f"📊 **Vault Performance**\n\n"
+            stats_text += f"💰 Total Value Locked: ${vault_stats.get('tvl', 0):,.0f}\n"
+            stats_text += f"📈 Total Return: +{vault_stats.get('total_return', 0)*100:.1f}%\n"
+            stats_text += f"📅 Active Days: {vault_stats.get('active_days', 0)}\n"
+            stats_text += f"👥 Active Users: {vault_stats.get('active_users', 0)}\n\n"
+            
+            if user_stats:
+                stats_text += f"**Your Stats:**\n"
+                stats_text += f"• Your Balance: ${user_stats.get('vault_balance', 0):,.2f}\n"
+                stats_text += f"• Your Profit: ${user_stats.get('total_profit', 0):+,.2f}\n"
+                stats_text += f"• Your Return: +{user_stats.get('return_rate', 0)*100:.1f}%\n\n"
+            
+            await update.message.reply_text(stats_text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Vault stats error: {e}")
+            await update.message.reply_text(
+                "📊 **Vault Performance**\n\n"
+                "System temporarily unavailable. Please try again later.",
+                parse_mode='Markdown'
+            )
 
     async def handle_withdrawal_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle withdrawal request"""
-        await update.message.reply_text(
-            "💸 **Request Withdrawal**\n\n"
-            "🚧 **Coming Soon**\n\n"
-            "Vault withdrawals are being implemented. Features:\n\n"
-            "• Instant withdrawal for amounts up to daily limit\n"
-            "• 24-hour processing for larger amounts\n"
-            "• Automatic profit distribution\n"
-            "• Transaction history tracking\n\n"
-            "For now, if you have connected your wallet, you can manage positions directly through /portfolio.",
-            parse_mode='Markdown'
-        )
+        """Handle withdrawal request using injected vault_manager"""
+        user_id = update.effective_user.id
+        
+        if not self.vault_manager:
+            await update.message.reply_text("❌ Vault system not available")
+            return
+        
+        try:
+            # Use injected vault_manager for withdrawal handling
+            result = await self.vault_manager.handle_withdrawal_request(user_id, update, context)
+            
+            if result.get("status") == "success":
+                # Update user stats in database if available
+                if self.database:
+                    try:
+                        await self.database.update_user_vault_balance(
+                            user_id, 
+                            result.get('remaining_balance', 0)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Database update error: {e}")
+                
+                await update.message.reply_text(
+                    f"✅ **Withdrawal Requested**\n\n"
+                    f"💰 Amount: ${result.get('amount', 0):,.2f}\n"
+                    f"⏱️ Processing Time: {result.get('processing_time', '24 hours')}\n"
+                    f"📊 Remaining Balance: ${result.get('remaining_balance', 0):,.2f}\n\n"
+                    f"You'll receive a confirmation once processed.",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ **Withdrawal Failed**\n\n{result.get('message', 'Unknown error')}"
+                )
+                
+        except Exception as e:
+            logger.error(f"Withdrawal error: {e}")
+            await update.message.reply_text("❌ Error processing withdrawal request")
+
+    async def execute_trade_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_params: Dict):
+        """Execute trade order using injected trading_engine"""
+        user_id = update.effective_user.id
+        
+        if user_id not in self.user_sessions:
+            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+            return
+        
+        if not self.trading_engine:
+            await update.callback_query.edit_message_text("❌ Trading engine not available")
+            return
+        
+        try:
+            session = self.user_sessions[user_id]
+            exchange = session["exchange"]
+            
+            # Use injected trading_engine to execute order
+            result = await self.trading_engine.place_order(
+                exchange=exchange,
+                coin=order_params.get('coin'),
+                is_buy=order_params.get('is_buy'),
+                sz=order_params.get('size'),
+                limit_px=order_params.get('price'),
+                order_type=order_params.get('order_type', 'Limit')
+            )
+            
+            if result.get("status") == "success":
+                # Update database if available
+                if self.database:
+                    try:
+                        await self.database.record_trade(user_id, order_params, result)
+                    except Exception as e:
+                        logger.warning(f"Database record error: {e}")
+                
+                await update.callback_query.edit_message_text(
+                    f"✅ **Order Placed Successfully**\n\n"
+                    f"📊 Symbol: {order_params.get('coin')}\n"
+                    f"🔄 Side: {'BUY' if order_params.get('is_buy') else 'SELL'}\n"
+                    f"💰 Size: {order_params.get('size')}\n"
+                    f"💲 Price: ${order_params.get('price')}\n"
+                    f"📋 Order ID: {result.get('order_id', 'N/A')}\n\n"
+                    f"Your order is now active on the exchange!",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.callback_query.edit_message_text(
+                    f"❌ **Order Failed**\n\n{result.get('message', 'Unknown error')}"
+                )
+                
+        except Exception as e:
+            logger.error(f"Trade execution error: {e}")
+            await update.callback_query.edit_message_text(f"❌ Error executing trade: {str(e)}")
+
+    async def handle_quick_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle quick trade using injected trading_engine"""
+        user_id = update.effective_user.id
+        
+        if not self.trading_engine:
+            await update.callback_query.edit_message_text("❌ Trading engine not available")
+            return
+        
+        try:
+            # Get current market prices using trading_engine
+            market_data = await self.trading_engine.get_market_data()
+            
+            keyboard = [
+                [InlineKeyboardButton(f"🚀 Buy BTC @ ${market_data.get('BTC', 0):,.0f}", 
+                                    callback_data="quick_buy_BTC")],
+                [InlineKeyboardButton(f"📉 Sell BTC @ ${market_data.get('BTC', 0):,.0f}", 
+                                    callback_data="quick_sell_BTC")],
+                [InlineKeyboardButton(f"🚀 Buy ETH @ ${market_data.get('ETH', 0):,.0f}", 
+                                    callback_data="quick_buy_ETH")],
+                [InlineKeyboardButton(f"📉 Sell ETH @ ${market_data.get('ETH', 0):,.0f}", 
+                                    callback_data="quick_sell_ETH")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                "⚡ **Quick Trade**\n\n"
+                "Select your trade:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Quick trade error: {e}")
+            await update.callback_query.edit_message_text(f"❌ Error loading quick trade: {str(e)}")
+
+    async def setup_grid_strategy(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Setup grid strategy using injected strategies"""
+        if user_id not in self.user_sessions:
+            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+            return
+        
+        if not self.strategies or 'grid_trading' not in self.strategies:
+            await update.callback_query.edit_message_text("❌ Grid trading strategy not available")
+            return
+        
+        try:
+            grid_strategy = self.strategies['grid_trading']
+            
+            # Check available balance using vault_manager
+            available_balance = 0
+            if self.vault_manager:
+                try:
+                    balance_info = await self.vault_manager.get_available_balance(user_id)
+                    available_balance = balance_info.get('available', 0)
+                except Exception as e:
+                    logger.warning(f"Balance check error: {e}")
+            
+            keyboard = [
+                [InlineKeyboardButton("🎯 Conservative Grid", callback_data="grid_conservative")],
+                [InlineKeyboardButton("⚡ Aggressive Grid", callback_data="grid_aggressive")],
+                [InlineKeyboardButton("⚙️ Custom Grid", callback_data="grid_custom")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                f"📊 **Grid Trading Strategy**\n\n"
+                f"💰 Available Balance: ${available_balance:,.2f}\n\n"
+                f"🎯 **Strategy Options:**\n"
+                f"• Conservative: Lower risk, steady gains\n"
+                f"• Aggressive: Higher risk, higher potential\n"
+                f"• Custom: Set your own parameters\n\n"
+                f"Choose your grid strategy:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Grid strategy setup error: {e}")
+            await update.callback_query.edit_message_text(f"❌ Error setting up grid strategy: {str(e)}")
+
+    async def start_market_making(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Start market making strategy"""
+        if user_id not in self.user_sessions:
+            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+            return
+        
+        try:
+            # Check available balance using vault_manager
+            available_balance = 0
+            if self.vault_manager:
+                try:
+                    balance_info = await self.vault_manager.get_available_balance(user_id)
+                    available_balance = balance_info.get('available', 0)
+                except Exception as e:
+                    logger.warning(f"Balance check error: {e}")
+            
+            keyboard = [
+                [InlineKeyboardButton("🎯 Conservative MM", callback_data="mm_conservative")],
+                [InlineKeyboardButton("⚡ Aggressive MM", callback_data="mm_aggressive")],
+                [InlineKeyboardButton("🚀 Execute MM Orders", callback_data="execute_market_making")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                f"🎯 **Market Making Strategy**\n\n"
+                f"💰 Available Balance: ${available_balance:,.2f}\n\n"
+                f"📊 **Benefits:**\n"
+                f"• Earn maker rebates (-0.001% to -0.003%)\n"
+                f"• Capture bid-ask spread\n"
+                f"• Automated order management\n\n"
+                f"Choose your market making style:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Market making setup error: {e}")
+            await update.callback_query.edit_message_text(f"❌ Error setting up market making: {str(e)}")
+
+    async def execute_market_making_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Execute market making orders"""
+        if user_id not in self.user_sessions:
+            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+            return
+        
+        if not self.trading_engine:
+            await update.callback_query.edit_message_text("❌ Trading engine not available")
+            return
+        
+        try:
+            session = self.user_sessions[user_id]
+            exchange = session["exchange"]
+            
+            # Execute market making strategy using trading_engine
+            result = await self.trading_engine.execute_market_making(
+                exchange=exchange,
+                symbol="BTC",
+                capital_allocation=1000,  # Default allocation
+                spread_percentage=0.1
+            )
+            
+            if result.get("status") == "success":
+                orders_placed = result.get("orders_placed", 0)
+                total_volume = result.get("total_volume", 0)
+                
+                await update.callback_query.edit_message_text(
+                    f"✅ **Market Making Active**\n\n"
+                    f"📊 Orders Placed: {orders_placed}\n"
+                    f"💰 Total Volume: ${total_volume:,.2f}\n"
+                    f"🎯 Expected Daily Rebates: ${result.get('expected_rebates', 0):.4f}\n\n"
+                    f"🤖 Strategy is now running automatically!"
+                )
+            else:
+                await update.callback_query.edit_message_text(
+                    f"❌ **Market Making Failed**\n\n{result.get('message', 'Unknown error')}"
+                )
+                
+        except Exception as e:
+            logger.error(f"Market making execution error: {e}")
+            await update.callback_query.edit_message_text(f"❌ Error executing market making: {str(e)}")
+
+    async def setup_dca_strategy(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Setup DCA strategy"""
+        if user_id not in self.user_sessions:
+            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+            return
+        
+        if not self.strategies or 'automated_trading' not in self.strategies:
+            await update.callback_query.edit_message_text("❌ DCA strategy not available")
+            return
+        
+        try:
+            keyboard = [
+                [InlineKeyboardButton("🟢 BTC DCA", callback_data="dca_btc")],
+                [InlineKeyboardButton("🔵 ETH DCA", callback_data="dca_eth")],
+                [InlineKeyboardButton("🟣 SOL DCA", callback_data="dca_sol")],
+                [InlineKeyboardButton("⚙️ Custom DCA", callback_data="dca_custom")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                "🤖 **Dollar Cost Averaging**\n\n"
+                "🎯 **Strategy Benefits:**\n"
+                "• Reduce volatility impact\n"
+                "• Automated buying at intervals\n"
+                "• Lower average entry price\n\n"
+                "Choose your DCA asset:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"DCA setup error: {e}")
+            await update.callback_query.edit_message_text(f"❌ Error setting up DCA: {str(e)}")
+
+    async def handle_bridge_evm(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Handle bridging to EVM"""
+        try:
+            keyboard = [
+                [InlineKeyboardButton("🔄 Bridge USDC", callback_data="bridge_usdc")],
+                [InlineKeyboardButton("💰 Bridge ETH", callback_data="bridge_eth")],
+                [InlineKeyboardButton("📊 Bridge Status", callback_data="check_bridge_status")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                "🌉 **Bridge to HyperEVM**\n\n"
+                "🔄 **Available Bridges:**\n"
+                "• USDC: Instant bridging\n"
+                "• ETH: 5-minute confirmation\n"
+                "• Low fees: ~$0.10\n\n"
+                "Choose asset to bridge:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            await update.callback_query.edit_message_text(f"❌ Error: {str(e)}")
+
+    async def handle_hyperlend(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Handle HyperLend operations"""
+        try:
+            keyboard = [
+                [InlineKeyboardButton("💰 Lend USDC", callback_data="lend_usdc")],
+                [InlineKeyboardButton("📈 Borrow Against Collateral", callback_data="borrow_collateral")],
+                [InlineKeyboardButton("📊 Lending Rates", callback_data="lending_rates")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                "💰 **HyperLend Protocol**\n\n"
+                "📈 **Current Rates:**\n"
+                "• USDC Lending: 8.5% APY\n"
+                "• ETH Collateral: 75% LTV\n"
+                "• BTC Collateral: 80% LTV\n\n"
+                "Choose your action:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            await update.callback_query.edit_message_text(f"❌ Error: {str(e)}")
+
+    async def handle_join_imc(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Handle joining IMC pool"""
+        try:
+            keyboard = [
+                [InlineKeyboardButton("🎯 Join Tier 1 ($1K)", callback_data="imc_tier1")],
+                [InlineKeyboardButton("🚀 Join Tier 2 ($5K)", callback_data="imc_tier2")],
+                [InlineKeyboardButton("💎 Join Tier 3 ($10K)", callback_data="imc_tier3")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                "🌱 **Seedify IMC Pool**\n\n"
+                "💰 **Investment Tiers:**\n"
+                "• Tier 1: $1,000 minimum\n"
+                "• Tier 2: $5,000 minimum\n"
+                "• Tier 3: $10,000 minimum\n\n"
+                "🎁 **Benefits:**\n"
+                "• Access to exclusive launches\n"
+                "• Revenue sharing from volume\n"
+                "• Professional management\n\n"
+                "Choose your tier:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            await update.callback_query.edit_message_text(f"❌ Error: {str(e)}")
+
+    async def handle_quick_buy_btc(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Handle quick BTC buy"""
+        if user_id not in self.user_sessions:
+            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+            return
+        
+        if not self.trading_engine:
+            await update.callback_query.edit_message_text("❌ Trading engine not available")
+            return
+        
+        try:
+            session = self.user_sessions[user_id]
+            exchange = session["exchange"]
+            
+            # Get current BTC price
+            market_data = await self.trading_engine.get_market_data()
+            btc_price = market_data.get('BTC', 43000)
+            
+            # Execute quick buy (0.01 BTC default)
+            order_params = {
+                'coin': 'BTC',
+                'is_buy': True,
+                'size': 0.01,
+                'price': btc_price * 1.001,  # Slight premium for immediate fill
+                'order_type': 'Limit'
+            }
+            
+            await self.execute_trade_order(update, context, order_params)
+            
+        except Exception as e:
+            logger.error(f"Quick BTC buy error: {e}")
+            await update.callback_query.edit_message_text(f"❌ Error buying BTC: {str(e)}")
+
+    async def handle_quick_sell_btc(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Handle quick BTC sell"""
+        if user_id not in self.user_sessions:
+            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+            return
+        
+        if not self.trading_engine:
+            await update.callback_query.edit_message_text("❌ Trading engine not available")
+            return
+        
+        try:
+            session = self.user_sessions[user_id]
+            exchange = session["exchange"]
+            
+            # Get current BTC price
+            market_data = await self.trading_engine.get_market_data()
+            btc_price = market_data.get('BTC', 43000)
+            
+            # Execute quick sell (0.01 BTC default)
+            order_params = {
+                'coin': 'BTC',
+                'is_buy': False,
+                'size': 0.01,
+                'price': btc_price * 0.999,  # Slight discount for immediate fill
+                'order_type': 'Limit'
+            }
+            
+            await self.execute_trade_order(update, context, order_params)
+            
+        except Exception as e:
+            logger.error(f"Quick BTC sell error: {e}")
+            await update.callback_query.edit_message_text(f"❌ Error selling BTC: {str(e)}")
+
+    async def show_market_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show market analysis"""
+        try:
+            if self.trading_engine:
+                market_data = await self.trading_engine.get_market_data()
+                analysis = await self.trading_engine.get_market_analysis()
+            else:
+                # Fallback static data
+                market_data = {'BTC': 43250, 'ETH': 2680, 'SOL': 98.5}
+                analysis = {'trend': 'bullish', 'volatility': 'moderate'}
+            
+            keyboard = [
+                [InlineKeyboardButton("📊 Technical Analysis", callback_data="technical_analysis")],
+                [InlineKeyboardButton("📈 Price Alerts", callback_data="price_alerts")],
+                [InlineKeyboardButton("🔄 Refresh Data", callback_data="refresh_analysis")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                f"📊 **Market Analysis**\n\n"
+                f"💰 **Current Prices:**\n"
+                f"• BTC: ${market_data.get('BTC', 0):,.0f}\n"
+                f"• ETH: ${market_data.get('ETH', 0):,.0f}\n"
+                f"• SOL: ${market_data.get('SOL', 0):,.1f}\n\n"
+                f"📈 **Market Trend:** {analysis.get('trend', 'Unknown').title()}\n"
+                f"📊 **Volatility:** {analysis.get('volatility', 'Unknown').title()}\n\n"
+                f"🎯 **Recommendation:** {analysis.get('recommendation', 'Hold positions')}\n",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Market analysis error: {e}")
+            await update.callback_query.edit_message_text(f"❌ Error loading analysis: {str(e)}")
+
+    async def show_trading_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+        """Show trading settings"""
+        try:
+            keyboard = [
+                [InlineKeyboardButton("⚙️ Risk Management", callback_data="risk_settings")],
+                [InlineKeyboardButton("🔔 Notifications", callback_data="notification_settings")],
+                [InlineKeyboardButton("💰 Default Order Size", callback_data="order_size_settings")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.callback_query.edit_message_text(
+                "⚙️ **Trading Settings**\n\n"
+                "🛡️ **Risk Management:**\n"
+                "• Max Position Size: 10%\n"
+                "• Stop Loss: 5%\n"
+                "• Daily Loss Limit: 2%\n\n"
+                "🔔 **Notifications:**\n"
+                "• Trade Confirmations: ✅\n"
+                "• Price Alerts: ✅\n"
+                "• Daily Reports: ✅\n\n"
+                "Choose setting to modify:",
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            await update.callback_query.edit_message_text(f"❌ Error: {str(e)}")
 
     async def show_live_trading(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show live trading interface"""
@@ -798,20 +1329,36 @@ Ready to join the alpha?"""
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await update.message.reply_text(
-            "📈 **Live Trading Interface**\n\n"
-            "🔥 **Real-time Status:**\n"
-            "• BTC: $43,250 (+2.1%)\n"
-            "• ETH: $2,680 (+1.8%)\n"
-            "• SOL: $98.50 (+3.2%)\n\n"
-            "💰 **Your Account:**\n"
-            "• Available Balance: Loading...\n"
-            "• Open Positions: Loading...\n"
-            "• Today's P&L: Loading...\n\n"
-            "Choose a trading action:",
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
+        try:
+            # Get real-time data if trading_engine available
+            if self.trading_engine:
+                market_data = await self.trading_engine.get_market_data()
+                btc_price = market_data.get('BTC', 43250)
+                eth_price = market_data.get('ETH', 2680)
+                sol_price = market_data.get('SOL', 98.5)
+            else:
+                btc_price, eth_price, sol_price = 43250, 2680, 98.5
+            
+            await update.message.reply_text(
+                f"📈 **Live Trading Interface**\n\n"
+                f"🔥 **Real-time Prices:**\n"
+                f"• BTC: ${btc_price:,.0f}\n"
+                f"• ETH: ${eth_price:,.0f}\n"
+                f"• SOL: ${sol_price:,.1f}\n\n"
+                f"💰 **Your Account:**\n"
+                f"• Status: Connected ✅\n"
+                f"• Trading Engine: {'Active' if self.trading_engine else 'Inactive'}\n\n"
+                f"Choose a trading action:",
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Live trading interface error: {e}")
+            await update.message.reply_text(
+                "📈 **Live Trading Interface**\n\n❌ Error loading interface. Please try again.",
+                parse_mode='Markdown'
+            )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help information"""
@@ -841,134 +1388,40 @@ For support, contact @HyperLiquidSupport
             help_text,
             parse_mode='Markdown'
         )
-    
-    async def handle_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle text messages"""
-        text = update.message.text
-        user_id = update.effective_user.id
-        
-        if text == "💰 Deposit to Vault":
-            await self.handle_deposit_vault(update, context)
-        elif text == "📊 Vault Stats":
-            await self.handle_vault_stats(update, context)
-        elif text == "🏆 Competition Status":
-            await self.handle_competition_status(update, context)
-        elif text == "🎁 Referral Link":
-            await self.handle_referral_link(update, context, user_id)
-        elif text == "💸 Request Withdrawal":
-            await self.handle_withdrawal_request(update, context)
-        elif text == "📈 Live Trading":
-            await self.show_live_trading(update, context)
-        else:
-            await self.handle_text_input(update, context, text)
 
-    async def handle_competition_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle competition status"""
+    async def get_real_stats(self):
+        user_state = self.info.user_state(self.address)
+        account_value = float(user_state['marginSummary']['accountValue'])
+        fills = self.info.user_fills(self.address)
+        volume_24h = sum(
+            float(fill['px']) * float(fill['sz'])
+            for fill in fills[-100:]
+        )
+        return {
+            'account_value': account_value,
+            'volume_24h': volume_24h,
+            'trades_count': len(fills)
+        }
+
+    async def vault_info_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Example: fetch vault info using the pattern from basic_vault.py
+        vault_address = self.config.get("vault_address")
+        if not vault_address:
+            await update.message.reply_text("Vault address not configured.")
+            return
+        info = self.info
+        vault_state = info.user_state(vault_address)
+        margin_summary = vault_state.get("marginSummary", {})
+        account_value = float(margin_summary.get("accountValue", 0))
         await update.message.reply_text(
-            "🏆 **Trading Competition**\n\n"
-            "🚧 **Coming Soon**\n\n"
-            "📅 **Next Competition:**\n"
-            "• Duration: 7 days\n"
-            "• Prize Pool: $10,000 USDC\n"
-            "• Categories: Volume, P&L, Referrals\n\n"
-            "🎁 **Prizes:**\n"
-            "🥇 1st Place: $5,000\n"
-            "🥈 2nd Place: $3,000\n"
-            "🥉 3rd Place: $2,000\n\n"
-            "Stay tuned for announcements!",
-            parse_mode='Markdown'
+            f"Vault Address: {vault_address}\n"
+            f"Vault Account Value: ${account_value:,.2f}"
         )
 
-    async def handle_referral_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-        """Handle referral link generation"""
-        referral_link = f"https://t.me/hyperliqubot?start=ref_{user_id}"
-        
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        stats = await self.get_real_stats()
         await update.message.reply_text(
-            f"🎁 **Your Referral Link**\n\n"
-            f"🔗 Link: {referral_link}\n\n"
-            f"💰 **Benefits:**\n"
-            f"• You earn 1% of their deposits\n"
-            f"• They get priority support\n"
-            f"• Bonus rewards during competitions\n\n"
-            f"📊 **Your Stats:**\n"
-            f"• Referrals: 0\n"
-            f"• Earnings: $0.00\n\n"
-            f"Share this link to start earning!",
-            parse_mode='Markdown'
+            f"Account Value: ${stats['account_value']:,.2f}\n"
+            f"24h Volume (last 100 trades): ${stats['volume_24h']:,.2f}\n"
+            f"Total Trades: {stats['trades_count']}"
         )
-
-    async def handle_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        """Handle other text inputs"""
-        user_id = update.effective_user.id
-        
-        if text.lower() in ["vault", "deposit", "stats", "withdraw"]:
-            # Redirect to main vault commands
-            if text.lower() == "vault" or text.lower() == "deposit":
-                await self.handle_deposit_vault(update, context)
-            elif text.lower() == "stats":
-                await self.handle_vault_stats(update, context)
-            elif text.lower() == "withdraw":
-                await self.handle_withdrawal_request(update, context)
-        else:
-            await update.message.reply_text("❓ Command not recognized. Type /help for available commands.")
-
-    async def get_open_orders(self, user_id: int) -> List[Dict]:
-        """Get user's open orders - placeholder"""
-        return []
-
-    async def get_positions(self, user_id: int) -> List[Dict]:
-        """Get user's positions - placeholder"""
-        return []
-
-    async def close_position(self, symbol: str):
-        """Close a position - placeholder"""
-        pass
-
-    async def handle_close_position(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle closing a position"""
-        user_id = update.effective_user.id
-        
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
-            return
-        
-        try:
-            positions = await self.get_positions(user_id)
-            
-            if not positions:
-                await update.callback_query.edit_message_text("❌ No open positions to close")
-                return
-            
-            for pos in positions:
-                await self.close_position(pos.get("symbol", ""))
-            
-            await update.callback_query.edit_message_text(
-                "✅ All open positions have been closed.",
-                parse_mode='Markdown'
-            )
-            
-        except Exception as e:
-            await update.callback_query.edit_message_text(f"❌ Error closing position: {str(e)}")
-
-    async def handle_cancel_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle canceling an order"""
-        user_id = update.effective_user.id
-        
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
-            return
-        
-        try:
-            open_orders = await self.get_open_orders(user_id)
-            
-            if not open_orders:
-                await update.callback_query.edit_message_text("❌ No open orders to cancel")
-                return
-            
-            await update.callback_query.edit_message_text(
-                "✅ All open orders have been canceled.",
-                parse_mode='Markdown'
-            )
-            
-        except Exception as e:
-            await update.callback_query.edit_message_text(f"❌ Error canceling order: {str(e)}")

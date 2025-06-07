@@ -1,3 +1,5 @@
+from asyncio.log import logger
+from datetime import datetime
 import json
 import os
 import time
@@ -20,6 +22,16 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from hyperliquid.utils.signing import sign_l1_action
+
+import sys
+import os
+
+# Import actual examples for real patterns
+examples_dir = os.path.join(os.path.dirname(__file__), '..', 'examples')
+sys.path.append(examples_dir)
+
+import basic_sub_account
+import example_utils
 
 
 class UserSession:
@@ -58,10 +70,55 @@ class UserSession:
 
 
 class UserManager:
-    def __init__(self, storage_path: str = "telegram_bot/users.json"):
+    """
+    Real user management using basic_sub_account.py patterns
+    Manages user sessions and vault interactions with actual API calls
+    """
+    
+    def __init__(self, vault_manager, exchange, info, storage_path: str = "telegram_bot/users.json"):
         self.storage_path = storage_path
         self.sessions: Dict[int, UserSession] = {}
         self.user_data = self._load_user_data()
+        
+        # Real Hyperliquid components
+        self.vault_manager = vault_manager
+        self.exchange = exchange
+        self.info = info
+        
+        # Database for user tracking
+        self._init_user_database()
+        
+        logger.info("UserManager initialized with real Hyperliquid integration")
+    
+    def _init_user_database(self):
+        """Initialize SQLite database for user tracking"""
+        import sqlite3
+        self.conn = sqlite3.connect('telegram_users.db')
+        cursor = self.conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS telegram_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                created_at REAL,
+                total_deposits REAL DEFAULT 0,
+                last_activity REAL
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_deposits (
+                deposit_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                amount REAL,
+                status TEXT,
+                created_at REAL,
+                confirmed_at REAL,
+                FOREIGN KEY (user_id) REFERENCES telegram_users (user_id)
+            )
+        ''')
+        
+        self.conn.commit()
     
     def _load_user_data(self) -> Dict:
         """Load user data from storage"""
@@ -77,23 +134,33 @@ class UserManager:
         with open(self.storage_path, 'w') as f:
             json.dump(self.user_data, f, indent=2)
     
-    def register_user(self, user_id: int, private_key: str, account_address: str = "") -> bool:
-        """Register a new user"""
+    async def create_user_session(self, user_id: int, username: str = None):
+        """Create user session and store in database"""
         try:
-            # Validate private key
-            account = eth_account.Account.from_key(private_key)
-            address = account_address if account_address else account.address
+            cursor = self.conn.cursor()
             
-            # Store user data (encrypted in production)
-            self.user_data[str(user_id)] = {
-                "private_key": private_key,  # Should be encrypted in production
-                "account_address": address,
-                "registered_at": time.time()
+            # Insert or update user record
+            cursor.execute('''
+                INSERT OR REPLACE INTO telegram_users 
+                (user_id, username, created_at, last_activity)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, username, time.time(), time.time()))
+            
+            self.conn.commit()
+            
+            # Create session
+            self.sessions[user_id] = {
+                'created_at': datetime.now(),
+                'username': username,
+                'active': True,
+                'last_activity': time.time()
             }
-            self._save_user_data()
-            return True
-        except Exception:
-            return False
+            
+            logger.info(f"Created session for user {user_id} ({username})")
+            
+        except Exception as e:
+            logger.error(f"Error creating user session: {e}")
+            raise
     
     def authenticate_user(self, user_id: int) -> Optional[UserSession]:
         """Authenticate user and create session"""
@@ -112,18 +179,302 @@ class UserManager:
         except Exception:
             return None
     
-    def get_session(self, user_id: int) -> Optional[UserSession]:
-        """Get active user session"""
-        return self.sessions.get(user_id)
+    async def get_user_balance(self, user_id: int) -> Dict:
+        """Get user balance from vault deposits using real API"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Get confirmed deposits
+            cursor.execute('''
+                SELECT SUM(amount) FROM user_deposits 
+                WHERE user_id = ? AND status = 'confirmed'
+            ''', (user_id,))
+            
+            result = cursor.fetchone()
+            total_deposited = result[0] if result[0] else 0.0
+            
+            # Get real vault performance for calculating current value
+            vault_balance = await self.vault_manager.get_vault_balance()
+
+            if vault_balance['status'] == 'success':
+                # Calculate user's proportional share
+                vault_total = vault_balance['total_value']
+                
+                # Get all confirmed deposits across all users
+                cursor.execute('''
+                    SELECT SUM(amount) FROM user_deposits 
+                    WHERE status = 'confirmed'
+                ''')
+                total_all_deposits = cursor.fetchone()[0] or 1.0
+                
+                # Calculate user's current value based on vault performance
+                user_share = total_deposited / total_all_deposits if total_all_deposits > 0 else 0
+                current_value = vault_total * user_share
+                unrealized_pnl = ((current_value - total_deposited) / total_deposited * 100) if total_deposited > 0 else 0
+                
+                return {
+                    'total_deposited': total_deposited,
+                    'current_value': current_value,
+                    'unrealized_pnl': unrealized_pnl,
+                    'available': current_value,  # For withdrawals
+                    'vault_share': user_share
+                }
+            else:
+                return {
+                    'total_deposited': total_deposited,
+                    'current_value': total_deposited,
+                    'unrealized_pnl': 0,
+                    'available': total_deposited,
+                    'vault_share': 0
+                }
+                
+        except Exception as e:
+            logger.error(f"Error getting user balance: {e}")
+            return {
+                'total_deposited': 0,
+                'current_value': 0,
+                'unrealized_pnl': 0,
+                'available': 0,
+                'vault_share': 0
+            }
+    
+    async def record_pending_deposit(self, user_id: int, deposit_id: str):
+        """Record pending deposit for tracking"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT INTO user_deposits 
+                (deposit_id, user_id, amount, status, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (deposit_id, user_id, 0, 'pending', time.time()))
+            
+            self.conn.commit()
+            logger.info(f"Recorded pending deposit {deposit_id} for user {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Error recording deposit: {e}")
+    
+    async def confirm_deposit(self, deposit_id: str, amount: float):
+        """Confirm deposit when detected on blockchain"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                UPDATE user_deposits 
+                SET amount = ?, status = 'confirmed', confirmed_at = ?
+                WHERE deposit_id = ?
+            ''', (amount, time.time(), deposit_id))
+            
+            self.conn.commit()
+            
+            # Get user_id for notification
+            cursor.execute('SELECT user_id FROM user_deposits WHERE deposit_id = ?', (deposit_id,))
+            result = cursor.fetchone()
+            
+            if result:
+                user_id = result[0]
+                logger.info(f"Confirmed deposit {deposit_id} for ${amount} for user {user_id}")
+                return user_id
+                
+        except Exception as e:
+            logger.error(f"Error confirming deposit: {e}")
+        
+        return None
+    
+    async def get_user_deposits(self, user_id: int) -> List[Dict]:
+        """Get all deposits for a user"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT deposit_id, amount, status, created_at, confirmed_at
+                FROM user_deposits 
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+            ''', (user_id,))
+            
+            deposits = []
+            for row in cursor.fetchall():
+                deposits.append({
+                    'deposit_id': row[0],
+                    'amount': row[1],
+                    'status': row[2],
+                    'created_at': row[3],
+                    'confirmed_at': row[4]
+                })
+            
+            return deposits
+            
+        except Exception as e:
+            logger.error(f"Error getting user deposits: {e}")
+            return []
+    
+    async def create_user_sub_account(self, user_id: int) -> Optional[str]:
+        """
+        Create sub-account for user using basic_sub_account.py pattern
+        This would be used for advanced users who want direct control
+        """
+        try:
+            # Generate sub-account name
+            sub_account_name = f"tg_user_{user_id}"
+            
+            # Use basic_sub_account pattern exactly
+            result = self.exchange.create_sub_account(sub_account_name)
+            print(f"Sub-account creation result: {result}")
+            
+            if result.get('status') == 'ok':
+                # Query sub-accounts like basic_sub_account.py
+                sub_accounts_data = self.info.query_sub_accounts(self.exchange.account_address)
+                
+                for sub_account in sub_accounts_data:
+                    if sub_account["name"] == sub_account_name:
+                        sub_account_address = sub_account["subAccountUser"]
+                        
+                        # Store in database
+                        cursor = self.conn.cursor()
+                        cursor.execute('''
+                            UPDATE telegram_users 
+                            SET sub_account_address = ?
+                            WHERE user_id = ?
+                        ''', (sub_account_address, user_id))
+                        self.conn.commit()
+                        
+                        logger.info(f"Created sub-account {sub_account_address} for user {user_id}")
+                        return sub_account_address
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error creating sub-account for user {user_id}: {e}")
+            return None
+    
+    async def fund_user_sub_account(self, user_id: int, usd_amount: float = 1.0):
+        """
+        Fund user's sub-account using basic_sub_account.py transfer pattern
+        """
+        try:
+            # Get user's sub-account address
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT sub_account_address FROM telegram_users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            
+            if not result or not result[0]:
+                # Create sub-account first
+                sub_account_address = await self.create_user_sub_account(user_id)
+                if not sub_account_address:
+                    return False
+            else:
+                sub_account_address = result[0]
+            
+            # Transfer USD following basic_sub_account.py pattern
+            usd_micro = int(usd_amount * 1_000_000)  # Convert to micro USDC
+            transfer_result = self.exchange.sub_account_transfer(
+                sub_account_address, True, usd_micro
+            )
+            print(f"USD transfer result: {transfer_result}")
+            
+            if transfer_result.get('status') == 'ok':
+                logger.info(f"Funded sub-account {sub_account_address} with ${usd_amount}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error funding sub-account for user {user_id}: {e}")
+            return False
     
     def cleanup_expired_sessions(self, timeout: int):
         """Remove expired sessions"""
-        expired_users = [
-            user_id for user_id, session in self.sessions.items()
-            if session.is_expired(timeout)
-        ]
+        current_time = time.time()
+        expired_users = []
+        
+        for user_id, session in self.sessions.items():
+            if current_time - session.get('last_activity', 0) > timeout:
+                expired_users.append(user_id)
+        
         for user_id in expired_users:
             del self.sessions[user_id]
+        
+        if expired_users:
+            logger.info(f"Cleaned up {len(expired_users)} expired sessions")
+    
+    def update_user_activity(self, user_id: int):
+        """Update user's last activity"""
+        if user_id in self.sessions:
+            self.sessions[user_id]['last_activity'] = time.time()
+        
+        # Update in database
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                UPDATE telegram_users 
+                SET last_activity = ?
+                WHERE user_id = ?
+            ''', (time.time(), user_id))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error updating user activity: {e}")
+    
+    def get_user_referral_link(self, user_id: int) -> str:
+        """Get referral link for user - synchronous method"""
+        return f"https://t.me/HyperLiquidBot?start=ref_{user_id}"
+    
+    async def get_user_referral_stats_async(self, user_id: int) -> Dict:
+        """Get referral stats asynchronously"""
+        from database import bot_db
+        return await bot_db.get_referral_stats(user_id)
+    
+    async def get_user_stats_async(self, user_id: int) -> Dict:
+        """Get user stats asynchronously"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT * FROM telegram_users WHERE user_id = ?', (user_id,))
+            row = cursor.fetchone()
+            
+            if row:
+                return {
+                    'user_id': row[0],
+                    'username': row[1],
+                    'created_at': row[2],
+                    'total_deposits': row[3],
+                    'last_activity': row[4],
+                    'account_address': getattr(self, 'account_address', 'N/A')
+                }
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting user stats: {e}")
+            return {}
+    
+    async def get_user_summary(self, user_id: int) -> str:
+        """Get comprehensive user summary"""
+        try:
+            # Get user stats asynchronously
+            user_stats = await self.get_user_stats_async(user_id)
+            referral_stats = await self.get_user_referral_stats_async(user_id)
+            
+            total_deposits = user_stats.get("total_deposits", 0)
+            deposit_status = "No deposits yet." if total_deposits == 0 else f"Total deposits: ${total_deposits}"
+            
+            # Referral info
+            referral_link = self.get_user_referral_link(user_id)
+            referral_stats_text = (
+                f"Referrals: {referral_stats.get('total_referrals', 0)}\n"
+                f"Referral earnings: ${referral_stats.get('total_earnings', 0):.2f}\n"
+                f"Your referral link: {referral_link}"
+            )
+            
+            # Combine all info
+            summary = (
+                f"User ID: {user_id}\n"
+                f"Account Address: {user_stats.get('account_address')}\n"
+                f"Created At: {datetime.fromtimestamp(user_stats.get('created_at')).strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Last Activity: {datetime.fromtimestamp(user_stats.get('last_activity')).strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"{deposit_status}\n"
+                f"{referral_stats_text}"
+            )
+            
+            return summary.strip()
+        
+        except Exception as e:
+            return f"Error getting user summary: {str(e)}"
 
 
 class HyperliquidTrader:
@@ -794,7 +1145,7 @@ class AdvancedRiskManager:
             
         except Exception as e:
             return {"status": "error", "message": str(e)}
-
+        
 
 class ProfitOptimizer:
     """
