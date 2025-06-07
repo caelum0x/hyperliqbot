@@ -1,7 +1,8 @@
 import json
 import time
 import sqlite3
-from typing import Dict, List, Optional
+import logging
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 @dataclass
@@ -23,6 +24,7 @@ class ReferralCommissionManager:
         self.base_commission_rate = base_commission_rate  # 10% default
         self.referral_users = {}
         self.commission_history = []
+        self.logger = logging.getLogger(__name__)
         
         # Initialize database
         self._init_database()
@@ -67,6 +69,60 @@ class ReferralCommissionManager:
                 FOREIGN KEY (referrer_id) REFERENCES referral_users (user_id)
             )
         ''')
+        
+        # Add new tables for enhanced referral tracking and analytics
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referral_leaderboard (
+                period TEXT,
+                referrer_id TEXT,
+                rank INTEGER,
+                volume REAL,
+                commissions REAL,
+                referrals INTEGER,
+                updated_at REAL,
+                PRIMARY KEY (period, referrer_id)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referral_tiers (
+                tier_id INTEGER PRIMARY KEY,
+                name TEXT,
+                min_volume REAL,
+                commission_rate REAL,
+                benefits TEXT,
+                color_code TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referral_analytics (
+                date TEXT,
+                total_referrers INTEGER,
+                active_referrers INTEGER,
+                new_signups INTEGER,
+                total_volume REAL,
+                total_commission REAL,
+                conversion_rate REAL,
+                avg_value_per_referral REAL,
+                PRIMARY KEY (date)
+            )
+        ''')
+        
+        # Populate default tier structure if not exists
+        cursor.execute("SELECT COUNT(*) FROM referral_tiers")
+        if cursor.fetchone()[0] == 0:
+            # Insert default tiers
+            tiers = [
+                (1, "Bronze", 0, 0.10, "Base commission rate", "#CD7F32"),
+                (2, "Silver", 1000000, 0.11, "11% commission + priority support", "#C0C0C0"),
+                (3, "Gold", 5000000, 0.12, "12% commission + VIP dashboard", "#FFD700"),
+                (4, "Platinum", 10000000, 0.15, "15% commission + custom links + VIP rewards", "#E5E4E2")
+            ]
+            cursor.executemany(
+                "INSERT INTO referral_tiers (tier_id, name, min_volume, commission_rate, benefits, color_code) VALUES (?, ?, ?, ?, ?, ?)",
+                tiers
+            )
         
         self.conn.commit()
     
@@ -144,6 +200,53 @@ class ReferralCommissionManager:
         except Exception as e:
             return {"status": "error", "message": str(e)}
     
+    def calculate_tiered_commission_rate(self, referrer_id: str, volume: float) -> float:
+        """Calculate tiered commission rate based on referee volume"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Get referrer's total referred volume
+            cursor.execute('''
+                SELECT SUM(total_volume) as referred_volume
+                FROM referral_users 
+                WHERE referrer_id = ?
+            ''', (referrer_id,))
+            
+            result = cursor.fetchone()
+            total_referred_volume = result[0] or 0
+            
+            # Get tiers from database
+            cursor.execute('''
+                SELECT tier_id, min_volume, commission_rate
+                FROM referral_tiers
+                ORDER BY min_volume DESC
+            ''')
+            
+            tiers = cursor.fetchall()
+            
+            # Find applicable tier
+            for tier_id, min_volume, commission_rate in tiers:
+                if total_referred_volume >= min_volume:
+                    # Update referrer's tier if needed
+                    cursor.execute('''
+                        UPDATE referral_users
+                        SET tier_level = ?
+                        WHERE user_id = ? AND tier_level != ?
+                    ''', (tier_id, referrer_id, tier_id))
+                    
+                    if cursor.rowcount > 0:
+                        self.conn.commit()
+                        self.logger.info(f"Upgraded referrer {referrer_id} to tier {tier_id}")
+                    
+                    return commission_rate
+            
+            # Default to base rate if no tier matches
+            return self.base_commission_rate
+                
+        except Exception as e:
+            self.logger.error(f"Error calculating tiered commission: {e}")
+            return self.base_commission_rate  # Default to base rate
+    
     def track_user_volume(self, user_id: str, volume: float) -> Dict:
         """
         Track trading volume for commission calculation
@@ -169,7 +272,10 @@ class ReferralCommissionManager:
             if not result or not result[0]:  # No referrer
                 return {"status": "no_referrer"}
             
-            referrer_id, commission_rate, total_volume = result
+            referrer_id, old_commission_rate, total_volume = result
+            
+            # Calculate tiered commission rate based on updated volume
+            commission_rate = self.calculate_tiered_commission_rate(referrer_id, volume)
             
             # Calculate commission (assuming 0.03% base trading fee)
             base_fee = volume * 0.0003  # 0.03% trading fee
@@ -191,6 +297,9 @@ class ReferralCommissionManager:
             
             self.conn.commit()
             
+            # Update leaderboards with the new volume and commission
+            self._update_leaderboards(referrer_id, volume, commission)
+            
             return {
                 "status": "commission_calculated",
                 "user_id": user_id,
@@ -198,212 +307,386 @@ class ReferralCommissionManager:
                 "volume": volume,
                 "commission": commission,
                 "commission_rate": commission_rate,
-                "total_volume": total_volume + volume
+                "total_volume": total_volume + volume,
+                "tier_changed": commission_rate != old_commission_rate
             }
             
         except Exception as e:
+            self.logger.error(f"Error tracking user volume: {e}")
             return {"status": "error", "message": str(e)}
     
-    def get_referrer_performance(self, referrer_id: str) -> Dict:
-        """
-        Get comprehensive performance data for a referrer
-        """
+    def _update_leaderboards(self, referrer_id: str, volume: float, commission: float):
+        """Update referral leaderboards with new activity"""
         try:
             cursor = self.conn.cursor()
+            now = time.time()
+            today = time.strftime("%Y-%m-%d")
+            week = time.strftime("%Y-W%W")  # Year-WeekNumber
+            month = time.strftime("%Y-%m")
             
-            # Get basic referrer stats
-            cursor.execute('''
-                SELECT COUNT(*) as referred_users,
-                       SUM(total_volume) as total_referred_volume,
-                       SUM(commission_earned) as total_commission
-                FROM referral_users 
-                WHERE referrer_id = ?
-            ''', (referrer_id,))
-            
-            stats = cursor.fetchone()
-            
-            # Get recent commission payments
-            cursor.execute('''
-                SELECT referred_user_id, commission_amount, volume_basis, timestamp
-                FROM commission_payments 
-                WHERE referrer_id = ?
-                ORDER BY timestamp DESC
-                LIMIT 20
-            ''', (referrer_id,))
-            
-            recent_payments = cursor.fetchall()
-            
-            # Get referral link performance
-            cursor.execute('''
-                SELECT link_id, campaign_name, clicks, conversions, created_time
-                FROM referral_links 
-                WHERE referrer_id = ?
-                ORDER BY created_time DESC
-            ''', (referrer_id,))
-            
-            links = cursor.fetchall()
-            
-            # Calculate conversion rates
-            total_clicks = sum(link[2] for link in links)
-            total_conversions = sum(link[3] for link in links)
-            conversion_rate = (total_conversions / total_clicks) if total_clicks > 0 else 0
-            
-            return {
-                "referrer_id": referrer_id,
-                "referred_users": stats[0] or 0,
-                "total_referred_volume": stats[1] or 0,
-                "total_commission_earned": stats[2] or 0,
-                "conversion_rate": conversion_rate,
-                "total_clicks": total_clicks,
-                "total_conversions": total_conversions,
-                "recent_payments": [
-                    {
-                        "user_id": payment[0],
-                        "commission": payment[1],
-                        "volume": payment[2],
-                        "timestamp": payment[3]
-                    }
-                    for payment in recent_payments
-                ],
-                "referral_links": [
-                    {
-                        "link_id": link[0],
-                        "campaign": link[1],
-                        "clicks": link[2],
-                        "conversions": link[3],
-                        "created": link[4]
-                    }
-                    for link in links
-                ]
-            }
-            
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-    
-    def optimize_commission_rates(self) -> Dict:
-        """
-        Optimize commission rates based on performance tiers
-        """
-        try:
-            cursor = self.conn.cursor()
-            
-            # Get all referrers with their performance
-            cursor.execute('''
-                SELECT r.user_id,
-                       COUNT(u.user_id) as referred_count,
-                       SUM(u.total_volume) as total_volume,
-                       r.commission_rate
-                FROM referral_users r
-                LEFT JOIN referral_users u ON r.user_id = u.referrer_id
-                WHERE r.user_id IN (SELECT DISTINCT referrer_id FROM referral_users WHERE referrer_id IS NOT NULL)
-                GROUP BY r.user_id
-            ''')
-            
-            referrers = cursor.fetchall()
-            optimizations = []
-            
-            for referrer_id, referred_count, total_volume, current_rate in referrers:
-                total_volume = total_volume or 0
+            # Update or create entries for daily, weekly, and monthly leaderboards
+            for period in [today, week, month]:
+                # Check if entry exists
+                cursor.execute('''
+                    SELECT volume, commissions, referrals 
+                    FROM referral_leaderboard 
+                    WHERE period = ? AND referrer_id = ?
+                ''', (period, referrer_id))
                 
-                # Determine optimal tier
-                new_rate = self.base_commission_rate
-                tier = 1
+                result = cursor.fetchone()
                 
-                if total_volume > 1000000:  # $1M+ volume
-                    new_rate = 0.15  # 15%
-                    tier = 4
-                elif total_volume > 500000:  # $500K+ volume
-                    new_rate = 0.13  # 13%
-                    tier = 3
-                elif total_volume > 100000:  # $100K+ volume
-                    new_rate = 0.12  # 12%
-                    tier = 2
-                
-                if new_rate != current_rate:
-                    # Update commission rate
+                if result:
+                    # Update existing entry
                     cursor.execute('''
-                        UPDATE referral_users 
-                        SET commission_rate = ?, tier_level = ?
-                        WHERE user_id = ?
-                    ''', (new_rate, tier, referrer_id))
-                    
-                    optimizations.append({
-                        "referrer_id": referrer_id,
-                        "old_rate": current_rate,
-                        "new_rate": new_rate,
-                        "tier": tier,
-                        "total_volume": total_volume
-                    })
+                        UPDATE referral_leaderboard
+                        SET volume = volume + ?,
+                            commissions = commissions + ?,
+                            updated_at = ?
+                        WHERE period = ? AND referrer_id = ?
+                    ''', (volume, commission, now, period, referrer_id))
+                else:
+                    # Create new entry
+                    cursor.execute('''
+                        INSERT INTO referral_leaderboard
+                        (period, referrer_id, rank, volume, commissions, referrals, updated_at)
+                        VALUES (?, ?, 0, ?, ?, 0, ?)
+                    ''', (period, referrer_id, volume, commission, now))
+            
+            # Recalculate ranks for each period
+            for period in [today, week, month]:
+                self._recalculate_leaderboard_ranks(period)
             
             self.conn.commit()
             
-            return {
-                "status": "rates_optimized",
-                "optimizations": optimizations,
-                "total_referrers_updated": len(optimizations)
-            }
-            
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            self.logger.error(f"Error updating leaderboards: {e}")
     
-    def generate_referral_report(self, days_back: int = 30) -> Dict:
-        """
-        Generate comprehensive referral performance report
-        """
+    def _recalculate_leaderboard_ranks(self, period: str):
+        """Recalculate ranks for a specific leaderboard period"""
         try:
             cursor = self.conn.cursor()
-            start_time = time.time() - (days_back * 86400)
             
-            # Total commission paid in period
+            # Get all referrers sorted by commission
             cursor.execute('''
-                SELECT SUM(commission_amount) as total_commission,
-                       COUNT(*) as payment_count
-                FROM commission_payments 
+                SELECT referrer_id, commissions
+                FROM referral_leaderboard
+                WHERE period = ?
+                ORDER BY commissions DESC
+            ''', (period,))
+            
+            referrers = cursor.fetchall()
+            
+            # Update ranks
+            for rank, (referrer_id, _) in enumerate(referrers, 1):
+                cursor.execute('''
+                    UPDATE referral_leaderboard
+                    SET rank = ?
+                    WHERE period = ? AND referrer_id = ?
+                ''', (rank, period, referrer_id))
+                
+        except Exception as e:
+            self.logger.error(f"Error recalculating leaderboard ranks: {e}")
+    
+    def get_leaderboard(self, period_type: str = "daily", limit: int = 10) -> List[Dict]:
+        """Get referral leaderboard for specified period"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Determine period based on type
+            if period_type == "daily":
+                period = time.strftime("%Y-%m-%d")
+            elif period_type == "weekly":
+                period = time.strftime("%Y-W%W")
+            elif period_type == "monthly":
+                period = time.strftime("%Y-%m")
+            elif period_type == "all_time":
+                # For all time, we'll need to aggregate from user data
+                cursor.execute('''
+                    SELECT 
+                        user_id as referrer_id, 
+                        SUM(total_volume) as volume,
+                        SUM(commission_earned) as commissions,
+                        COUNT(*) as referrals
+                    FROM referral_users
+                    WHERE referrer_id IS NOT NULL
+                    GROUP BY referrer_id
+                    ORDER BY commissions DESC
+                    LIMIT ?
+                ''', (limit,))
+                
+                results = cursor.fetchall()
+                leaders = []
+                
+                for i, (referrer_id, volume, commissions, referrals) in enumerate(results, 1):
+                    # Get referrer's tier
+                    cursor.execute("SELECT tier_level FROM referral_users WHERE user_id = ?", (referrer_id,))
+                    tier_result = cursor.fetchone()
+                    tier = tier_result[0] if tier_result else 1
+                    
+                    leaders.append({
+                        "rank": i,
+                        "referrer_id": referrer_id,
+                        "volume": volume or 0,
+                        "commissions": commissions or 0,
+                        "referrals": referrals or 0,
+                        "tier": tier
+                    })
+                
+                return leaders
+            else:
+                # Get leaderboard for specific period
+                cursor.execute('''
+                    SELECT 
+                        lb.rank,
+                        lb.referrer_id,
+                        lb.volume,
+                        lb.commissions,
+                        lb.referrals,
+                        u.tier_level as tier
+                    FROM referral_leaderboard lb
+                    LEFT JOIN referral_users u ON lb.referrer_id = u.user_id
+                    WHERE lb.period = ?
+                    ORDER BY lb.rank ASC
+                    LIMIT ?
+                ''', (period, limit))
+                
+                results = cursor.fetchall()
+                leaders = []
+                
+                for row in results:
+                    leaders.append({
+                        "rank": row[0],
+                        "referrer_id": row[1],
+                        "volume": row[2] or 0,
+                        "commissions": row[3] or 0,
+                        "referrals": row[4] or 0,
+                        "tier": row[5] or 1
+                    })
+                
+                return leaders
+            
+        except Exception as e:
+            self.logger.error(f"Error getting leaderboard: {e}")
+            return []
+    
+    def track_referral_click(self, link_id: str) -> Dict:
+        """Track click on referral link"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Update click count
+            cursor.execute('''
+                UPDATE referral_links
+                SET clicks = clicks + 1
+                WHERE link_id = ?
+            ''', (link_id,))
+            
+            if cursor.rowcount == 0:
+                return {"status": "error", "message": "Invalid link ID"}
+            
+            self.conn.commit()
+            return {"status": "click_tracked"}
+            
+        except Exception as e:
+            self.logger.error(f"Error tracking referral click: {e}")
+            return {"status": "error", "message": str(e)}
+    
+    def get_referral_analytics_dashboard(self) -> Dict:
+        """Get comprehensive referral analytics for dashboard"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Get general statistics
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_referrers,
+                    COUNT(CASE WHEN tier_level > 1 THEN 1 END) as premium_referrers,
+                    SUM(total_volume) as total_volume,
+                    SUM(commission_earned) as total_commission
+                FROM referral_users
+                WHERE user_id IN (
+                    SELECT DISTINCT referrer_id FROM referral_users WHERE referrer_id IS NOT NULL
+                )
+            ''')
+            
+            general_stats = cursor.fetchone()
+            
+            # Get tier distribution
+            cursor.execute('''
+                SELECT 
+                    tier_level,
+                    COUNT(*) as referrer_count,
+                    t.name as tier_name,
+                    t.commission_rate,
+                    t.color_code
+                FROM referral_users u
+                JOIN referral_tiers t ON u.tier_level = t.tier_id
+                WHERE u.user_id IN (
+                    SELECT DISTINCT referrer_id FROM referral_users WHERE referrer_id IS NOT NULL
+                )
+                GROUP BY tier_level
+                ORDER BY tier_level ASC
+            ''')
+            
+            tier_distribution = [
+                {
+                    "tier": row[0],
+                    "count": row[1],
+                    "name": row[2],
+                    "commission_rate": row[3],
+                    "color": row[4]
+                }
+                for row in cursor.fetchall()
+            ]
+            
+            # Get monthly performance trend
+            cursor.execute('''
+                SELECT 
+                    strftime('%Y-%m', datetime(timestamp/1000, 'unixepoch')) as month,
+                    SUM(commission_amount) as monthly_commission,
+                    SUM(volume_basis) as monthly_volume,
+                    COUNT(DISTINCT referrer_id) as active_referrers
+                FROM commission_payments
                 WHERE timestamp > ?
-            ''', (start_time,))
+                GROUP BY month
+                ORDER BY month DESC
+                LIMIT 12
+            ''', (time.time() - 86400 * 365,))  # Last 365 days
             
-            commission_stats = cursor.fetchone()
+            monthly_trend = [
+                {
+                    "month": row[0],
+                    "commission": row[1],
+                    "volume": row[2],
+                    "active_referrers": row[3]
+                }
+                for row in cursor.fetchall()
+            ]
             
-            # Top performing referrers
+            # Get top performing campaigns
             cursor.execute('''
-                SELECT referrer_id,
-                       SUM(commission_amount) as period_commission,
-                       SUM(volume_basis) as period_volume,
-                       COUNT(*) as transactions
-                FROM commission_payments 
-                WHERE timestamp > ?
-                GROUP BY referrer_id
-                ORDER BY period_commission DESC
-                LIMIT 10
-            ''', (start_time,))
+                SELECT 
+                    campaign_name,
+                    SUM(clicks) as total_clicks,
+                    SUM(conversions) as total_conversions,
+                    CASE WHEN SUM(clicks) > 0 
+                        THEN CAST(SUM(conversions) AS FLOAT) / SUM(clicks) 
+                        ELSE 0 
+                    END as conversion_rate
+                FROM referral_links
+                GROUP BY campaign_name
+                ORDER BY total_conversions DESC
+                LIMIT 5
+            ''')
             
-            top_referrers = cursor.fetchall()
-            
-            # New user signups
-            cursor.execute('''
-                SELECT COUNT(*) as new_users
-                FROM referral_users 
-                WHERE signup_time > ? AND referrer_id IS NOT NULL
-            ''', (start_time,))
-            
-            new_signups = cursor.fetchone()[0]
+            top_campaigns = [
+                {
+                    "name": row[0],
+                    "clicks": row[1],
+                    "conversions": row[2],
+                    "conversion_rate": row[3]
+                }
+                for row in cursor.fetchall()
+            ]
             
             return {
-                "period_days": days_back,
-                "total_commission_paid": commission_stats[0] or 0,
-                "total_payments": commission_stats[1] or 0,
-                "new_referred_users": new_signups,
-                "top_referrers": [
-                    {
-                        "referrer_id": ref[0],
-                        "commission_earned": ref[1],
-                        "volume_generated": ref[2],
-                        "transactions": ref[3]
-                    }
-                    for ref in top_referrers
-                ],
-                "avg_commission_per_payment": (commission_stats[0] / commission_stats[1]) if commission_stats[1] > 0 else 0
+                "general_stats": {
+                    "total_referrers": general_stats[0] or 0,
+                    "premium_referrers": general_stats[1] or 0,
+                    "premium_percentage": (general_stats[1] / general_stats[0] * 100) if general_stats[0] > 0 else 0,
+                    "total_volume": general_stats[2] or 0,
+                    "total_commission": general_stats[3] or 0
+                },
+                "tier_distribution": tier_distribution,
+                "monthly_trend": monthly_trend,
+                "top_campaigns": top_campaigns,
+                "leaderboards": {
+                    "daily": self.get_leaderboard("daily", 5),
+                    "weekly": self.get_leaderboard("weekly", 5),
+                    "monthly": self.get_leaderboard("monthly", 5)
+                }
             }
             
         except Exception as e:
+            self.logger.error(f"Error getting referral analytics: {e}")
+            return {"status": "error", "message": str(e)}
+    
+    def get_referrer_tier_info(self, referrer_id: str) -> Dict:
+        """Get detailed information about referrer's current tier and next tier requirements"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Get referrer's current tier and volume
+            cursor.execute('''
+                SELECT r.tier_level, r.total_volume, t.name, t.commission_rate, t.benefits, t.color_code
+                FROM referral_users r
+                JOIN referral_tiers t ON r.tier_level = t.tier_id
+                WHERE r.user_id = ?
+            ''', (referrer_id,))
+            
+            referrer_data = cursor.fetchone()
+            if not referrer_data:
+                return {"status": "error", "message": "Referrer not found"}
+            
+            current_tier, current_volume, tier_name, commission_rate, benefits, color_code = referrer_data
+            
+            # Find next tier requirements
+            cursor.execute('''
+                SELECT tier_id, name, min_volume, commission_rate, benefits, color_code
+                FROM referral_tiers
+                WHERE min_volume > ?
+                ORDER BY min_volume ASC
+                LIMIT 1
+            ''', (current_volume,))
+            
+            next_tier_data = cursor.fetchone()
+            next_tier_info = None
+            
+            if next_tier_data:
+                next_tier_id, next_tier_name, next_tier_min, next_tier_rate, next_tier_benefits, next_color = next_tier_data
+                volume_needed = next_tier_min - current_volume
+                
+                next_tier_info = {
+                    "tier_id": next_tier_id,
+                    "name": next_tier_name,
+                    "min_volume": next_tier_min,
+                    "commission_rate": next_tier_rate,
+                    "benefits": next_tier_benefits,
+                    "color_code": next_color,
+                    "volume_needed": volume_needed,
+                    "progress_percentage": (current_volume / next_tier_min * 100) if next_tier_min > 0 else 0
+                }
+            
+            # Get referrer statistics
+            cursor.execute('''
+                SELECT COUNT(*) as referred_count,
+                       SUM(total_volume) as referred_volume
+                FROM referral_users
+                WHERE referrer_id = ?
+            ''', (referrer_id,))
+            
+            stats_data = cursor.fetchone()
+            referred_count = stats_data[0] or 0
+            referred_volume = stats_data[1] or 0
+            
+            return {
+                "referrer_id": referrer_id,
+                "current_tier": {
+                    "tier_id": current_tier,
+                    "name": tier_name,
+                    "commission_rate": commission_rate,
+                    "benefits": benefits,
+                    "color_code": color_code
+                },
+                "next_tier": next_tier_info,
+                "stats": {
+                    "referred_count": referred_count,
+                    "referred_volume": referred_volume,
+                    "average_volume": referred_volume / referred_count if referred_count > 0 else 0
+                },
+                "is_max_tier": next_tier_info is None
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting referrer tier info: {e}")
             return {"status": "error", "message": str(e)}

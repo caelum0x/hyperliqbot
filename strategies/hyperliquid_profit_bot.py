@@ -1,12 +1,14 @@
 import asyncio
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import uuid
 import sys
 import os
 import logging
+import numpy as np
+from scipy.optimize import minimize
 
 # Real Hyperliquid imports
 from hyperliquid.exchange import Exchange
@@ -41,7 +43,7 @@ class HyperliquidProfitBot:
     Uses real examples: basic_order.py and basic_adding.py
     """
     
-    def __init__(self, exchange: Exchange = None, info: Info = None, base_url: str = None):
+    def __init__(self, exchange: Exchange = None, info: Info = None, base_url: str = None, vault_address: str = None):
         if exchange and info:
             self.exchange = exchange
             self.info = info
@@ -53,7 +55,7 @@ class HyperliquidProfitBot:
                 skip_ws=True
             )
         
-        self.vault_address = "HL_VAULT_001" 
+        self.vault_address = vault_address or "HL_VAULT_001" 
         self.bot_name = "HLALPHA_BOT"
         self.users = {}
         self.revenue_tracking = {
@@ -64,7 +66,24 @@ class HyperliquidProfitBot:
             "daily_total": 0
         }
         
+        # Store market liquidity data
+        self.market_liquidity_cache = {}
+        self.market_liquidity_timestamp = 0
+        
+        # Store correlation data for portfolio optimization
+        self.correlation_matrix = {}
+        self.volatility_data = {}
+        self.last_correlation_update = 0
+        
+        # VaultManager integration
+        self.vault_manager = None
+        
         logger.info("HyperliquidProfitBot initialized with real Hyperliquid API")
+    
+    def set_vault_manager(self, vault_manager):
+        """Set the vault manager for integration"""
+        self.vault_manager = vault_manager
+        logger.info(f"VaultManager integration enabled for ProfitBot")
 
     async def maker_rebate_strategy(self, coin: str, position_size: float = 0.1) -> Dict:
         """
@@ -361,6 +380,243 @@ class HyperliquidProfitBot:
             
         except Exception as e:
             logger.error(f"Error getting performance metrics: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def execute_fee_tier_progression_strategy(self, target_tier: int = 3, 
+                                              max_daily_capital: float = 1000) -> Dict:
+        """
+        Execute a complete strategy to progress to a higher fee tier by
+        automating market making across optimal pairs
+        
+        Args:
+            target_tier: Target fee tier (1-3)
+            max_daily_capital: Maximum daily capital to deploy
+        """
+        try:
+            # First get current tier status
+            tier_analysis = await self.optimize_rebate_tier_progression(target_tier)
+            
+            if tier_analysis.get('status') == 'already_achieved':
+                return {
+                    'status': 'already_achieved',
+                    'message': f'Already at target tier {target_tier}',
+                    'current_tier': tier_analysis.get('current_tier'),
+                    'current_maker_pct': tier_analysis.get('current_maker_pct')
+                }
+            
+            if tier_analysis.get('status') != 'success':
+                return tier_analysis
+                
+            # Calculate daily maker volume target
+            daily_volume_target = tier_analysis.get('additional_maker_volume_needed', 0) / 14
+            
+            # Calculate capital needed based on efficient capital utilization
+            # Assume each unit of capital can generate ~3x in daily maker volume
+            capital_needed = daily_volume_target / 3
+            
+            # Limit to max daily capital
+            capital_to_deploy = min(capital_needed, max_daily_capital)
+            
+            # Get recommended pairs for efficient market making
+            recommended_pairs = tier_analysis.get('recommended_pairs', ['BTC', 'ETH', 'SOL'])
+            
+            # Prioritize pairs with highest liquidity
+            market_data = await self._get_market_liquidity_data()
+            
+            # Sort by maker rebate opportunity score (liquidity * spread)
+            optimal_pairs = []
+            for coin_data in market_data:
+                if coin_data['coin'] in recommended_pairs:
+                    # Calculate maker rebate opportunity score
+                    spread_bps = coin_data.get('spread_bps', 10)
+                    liquidity = coin_data.get('liquidity', 0)
+                    
+                    if 3 <= spread_bps <= 20 and liquidity > 50000:
+                        opportunity_score = liquidity / 1000000 * spread_bps
+                        optimal_pairs.append({
+                            'coin': coin_data['coin'],
+                            'score': opportunity_score,
+                            'liquidity': liquidity,
+                            'spread_bps': spread_bps
+                        })
+            
+            # Sort by opportunity score
+            optimal_pairs.sort(key=lambda x: x['score'], reverse=True)
+            
+            # Limit to top 5 pairs
+            optimal_pairs = optimal_pairs[:5]
+            
+            if not optimal_pairs:
+                return {
+                    'status': 'error',
+                    'message': 'No suitable pairs found for fee tier progression'
+                }
+            
+            # Allocate capital across pairs weighted by opportunity score
+            total_score = sum(pair['score'] for pair in optimal_pairs)
+            
+            if total_score <= 0:
+                return {
+                    'status': 'error',
+                    'message': 'Invalid opportunity scores'
+                }
+            
+            for pair in optimal_pairs:
+                pair['allocation'] = (pair['score'] / total_score) * capital_to_deploy
+            
+            # Execute market making on each pair
+            execution_results = []
+            for pair in optimal_pairs:
+                # Calculate position size based on allocation and mid price
+                mid_price = float(self.info.all_mids().get(pair['coin'], 0))
+                if mid_price <= 0:
+                    continue
+                    
+                position_size = pair['allocation'] / (mid_price * 2)  # Divide by 2 for buy+sell
+                
+                # Execute adaptive market making
+                result = await self.adaptive_market_making(
+                    coin=pair['coin'],
+                    position_size=position_size,
+                    min_spread_bps=3.0,
+                    max_spread_bps=20.0
+                )
+                
+                execution_results.append({
+                    'coin': pair['coin'],
+                    'allocation': pair['allocation'],
+                    'position_size': position_size,
+                    'result': result
+                })
+            
+            successful_executions = sum(1 for r in execution_results 
+                                      if r['result'] and r['result'].get('status') == 'success')
+            
+            # Calculate expected rebates
+            total_maker_volume = sum(
+                r['allocation'] * 2  # Both buy and sell side
+                for r in execution_results 
+                if r['result'] and r['result'].get('status') == 'success'
+            )
+            
+            # Calculate rebate tier improvement
+            current_rebate = 0
+            target_rebate = 0
+            
+            current_maker_pct = tier_analysis.get('current_maker_pct', 0) / 100
+            if current_maker_pct >= 0.03:
+                current_rebate = 0.00003  # -0.003%
+            elif current_maker_pct >= 0.015:
+                current_rebate = 0.00002  # -0.002%
+            elif current_maker_pct >= 0.005:
+                current_rebate = 0.00001  # -0.001%
+            
+            if target_tier == 3:
+                target_rebate = 0.00003  # -0.003%
+            elif target_tier == 2:
+                target_rebate = 0.00002  # -0.002%
+            elif target_tier == 1:
+                target_rebate = 0.00001  # -0.001%
+                
+            rebate_improvement = target_rebate - current_rebate
+            daily_rebate_gain = total_maker_volume * rebate_improvement
+            
+            # Update in revenue tracking
+            self.revenue_tracking["maker_rebates"] += daily_rebate_gain
+            
+            return {
+                'status': 'success' if successful_executions > 0 else 'error',
+                'tier_progression': {
+                    'current_tier': tier_analysis.get('current_tier', 0),
+                    'target_tier': target_tier,
+                    'current_maker_pct': tier_analysis.get('current_maker_pct', 0),
+                    'additional_maker_pct_needed': tier_analysis.get('additional_maker_pct_needed', 0)
+                },
+                'execution': {
+                    'capital_deployed': capital_to_deploy,
+                    'pairs_executed': successful_executions,
+                    'total_maker_volume': total_maker_volume
+                },
+                'rebate_optimization': {
+                    'rebate_improvement': rebate_improvement,
+                    'daily_rebate_gain': daily_rebate_gain,
+                    'monthly_projection': daily_rebate_gain * 30
+                },
+                'execution_details': execution_results
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error executing fee tier progression: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def optimize_all_rebate_strategies(self, max_capital: float = 2000) -> Dict:
+        """
+        Execute comprehensive rebate optimization across all available strategies
+        
+        Args:
+            max_capital: Maximum capital to deploy
+        """
+        try:
+            results = {}
+            
+            # 1. First optimize fee tier progression
+            tier_progression = await self.execute_fee_tier_progression_strategy(
+                target_tier=3,
+                max_daily_capital=max_capital * 0.5  # Use 50% for tier progression
+            )
+            results['tier_progression'] = tier_progression
+            
+            # Track capital used
+            capital_used = tier_progression.get('execution', {}).get('capital_deployed', 0) \
+                          if tier_progression.get('status') in ['success', 'already_achieved'] else 0
+            
+            # 2. Execute multi-pair market making with remaining capital
+            remaining_capital = max_capital - capital_used
+            
+            if remaining_capital >= 100:  # Only if we have at least $100 left
+                mm_result = await self.market_make_multiple_coins(
+                    max_coins=5,
+                    total_allocation=remaining_capital
+                )
+                results['market_making'] = mm_result
+                
+                if mm_result.get('status') == 'success':
+                    capital_used += remaining_capital
+            
+            # 3. Calculate overall expected returns
+            total_rebates = 0
+            
+            # Add tier progression rebates
+            if tier_progression.get('status') == 'success':
+                tier_rebates = tier_progression.get('rebate_optimization', {}).get('daily_rebate_gain', 0)
+                total_rebates += tier_rebates
+            
+            # Add market making rebates
+            if 'market_making' in results and results['market_making'].get('status') == 'success':
+                mm_rebates = results['market_making'].get('expected_rebate', 0)
+                total_rebates += mm_rebates
+            
+            # Calculate ROI
+            daily_roi = total_rebates / max_capital if max_capital > 0 else 0
+            
+            return {
+                'status': 'success',
+                'capital': {
+                    'max_capital': max_capital,
+                    'capital_used': capital_used,
+                    'remaining': max_capital - capital_used
+                },
+                'rebate_estimate': {
+                    'daily_rebates': total_rebates,
+                    'monthly_rebates': total_rebates * 30,
+                    'daily_roi': daily_roi,
+                    'annual_roi': daily_roi * 365
+                },
+                'strategy_results': results
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error optimizing rebate strategies: {e}")
             return {'status': 'error', 'message': str(e)}
 
 class BotReferralSystem:

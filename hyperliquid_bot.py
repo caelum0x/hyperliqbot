@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-REAL Hyperliquid Trading Bot - No mock code, actual implementation
-Uses the existing configuration system and database integration
-"""
+
 
 import asyncio
 import os

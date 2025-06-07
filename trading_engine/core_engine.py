@@ -118,6 +118,17 @@ class TradingEngine:
             self.wallet_manager = None
         
         self.logger = logging.getLogger(__name__)
+        
+        # Risk management system
+        self.risk_manager = RiskManagementSystem()
+        
+        # Store coin volatility data for position sizing
+        self.volatility_cache = {}
+        self.volatility_cache_time = {}
+        
+        # Cross-correlation data
+        self.correlation_matrix = {}
+        self.last_correlation_update = 0
 
     def use_wallet(self, wallet_name: str, sub_account_name: str = None):
         """Switch to using a specific wallet or sub-account"""
@@ -445,104 +456,472 @@ class TradingEngine:
             self.logger.error(f"Error closing position: {e}")
             return {"status": "error", "message": str(e)}
 
-class ProfitOptimizedTrader:
-    """
-    Profit optimization wrapper around TradingEngine
-    """
-    
-    def __init__(self, trading_engine: TradingEngine, config: TradingConfig):
-        self.engine = trading_engine
-        self.config = config
-        self.logger = logging.getLogger(__name__)
-        
-    async def smart_limit_order(self, coin: str, is_buy: bool, size: float, price: float):
-        """Place optimized limit order for maximum rebates"""
+    async def calculate_optimal_position_size(self, coin: str, risk_pct: float = 0.01) -> float:
+        """Calculate optimal position size based on account value and volatility"""
         try:
-            # Always use Alo (Add Liquidity Only) for maker rebates
-            result = await self.engine.place_limit_order(coin, is_buy, size, price)
+            # Get account value
+            user_state = await self.get_user_state()
+            account_value = float(user_state.get("marginSummary", {}).get("accountValue", 0))
             
-            if result.get("status") == "ok":
-                # Query order status by oid like basic_order.py
-                status = result["response"]["data"]["statuses"][0]
-                if "resting" in status:
-                    order_status = self.engine.info.query_order_by_oid(
-                        self.engine.address, status["resting"]["oid"]
-                    )
-                    self.logger.info(f"Order status by oid: {order_status}")
-                    
-            return result
+            # Get coin volatility
+            volatility = await self._calculate_coin_volatility(coin)
+            
+            # Risk management adjustment
+            risk_adjustment = self.risk_manager.get_risk_adjustment(coin)
+            adjusted_risk_pct = risk_pct * risk_adjustment
+            
+            # Kelly criterion calculation
+            if volatility > 0:
+                # Risk no more than x% of account
+                max_risk = account_value * adjusted_risk_pct
+                position_size = max_risk / volatility
+                
+                # Apply additional position limits
+                current_exposure = await self._get_current_exposure()
+                max_account_exposure = 0.5  # Max 50% of account in all positions
+                
+                if current_exposure + position_size > account_value * max_account_exposure:
+                    position_size = max(0, (account_value * max_account_exposure) - current_exposure)
+                
+                self.logger.info(f"Calculated position size for {coin}: ${position_size:.2f} " +
+                                f"(volatility: {volatility:.4f}, risk: {adjusted_risk_pct:.2%})")
+                return position_size
+            return 0
         except Exception as e:
-            self.logger.error(f"Error in smart limit order: {e}")
+            self.logger.error(f"Error calculating position size: {e}")
+            return 0
+
+    async def _calculate_coin_volatility(self, coin: str, lookback_hours: int = 24) -> float:
+        """Calculate coin volatility based on price history"""
+        try:
+            # Check cache first (refresh every hour)
+            current_time = time.time()
+            if (coin in self.volatility_cache and 
+                current_time - self.volatility_cache_time.get(coin, 0) < 3600):
+                return self.volatility_cache[coin]
+            
+            # Get price history
+            candles = self.info.candles_snapshot(coin, "1h", lookback_hours)
+            
+            if len(candles) < 6:
+                self.logger.warning(f"Insufficient price history for {coin}")
+                return 0.02  # Default 2% volatility
+            
+            # Calculate returns
+            prices = [float(candle["c"]) for candle in candles]
+            returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
+            
+            # Calculate volatility (standard deviation of returns)
+            import numpy as np
+            volatility = np.std(returns)
+            
+            # Annualize and normalize
+            annualized_volatility = volatility * np.sqrt(24 * 365)  # 24 hours in a day
+            normalized_volatility = min(0.05, max(0.005, annualized_volatility))  # Cap between 0.5% and 5%
+            
+            # Cache result
+            self.volatility_cache[coin] = normalized_volatility
+            self.volatility_cache_time[coin] = current_time
+            
+            return normalized_volatility
+        except Exception as e:
+            self.logger.error(f"Error calculating volatility for {coin}: {e}")
+            return 0.02  # Default 2% volatility
+
+    async def _get_current_exposure(self) -> float:
+        """Get current position exposure"""
+        try:
+            user_state = await self.get_user_state()
+            positions = user_state.get("positions", [])
+            
+            total_exposure = 0
+            for position in positions:
+                size = abs(float(position.get("szi", 0)))
+                entry_price = float(position.get("entryPx", 0))
+                exposure = size * entry_price
+                total_exposure += exposure
+            
+            return total_exposure
+        except Exception as e:
+            self.logger.error(f"Error calculating current exposure: {e}")
+            return 0
+
+    async def place_smart_order(self, coin: str, is_buy: bool, risk_pct: float = 0.01, 
+                             limit_price=None, order_type="limit"):
+        """Place order with intelligent position sizing and risk management"""
+        try:
+            # Check risk management first
+            if not self.risk_manager.can_trade(coin):
+                return {"status": "rejected", "reason": "risk_management", 
+                        "message": f"Trading {coin} blocked by risk management"}
+                
+            # Calculate optimal position size
+            position_size_usd = await self.calculate_optimal_position_size(coin, risk_pct)
+            
+            # Get current price if limit price not specified
+            if not limit_price:
+                mids = self.info.all_mids()
+                mid_price = float(mids.get(coin, 0))
+                # Add a small buffer for market orders or use mid price for limit orders
+                limit_price = mid_price * (0.998 if is_buy else 1.002) if order_type == "market" else mid_price
+            else:
+                limit_price = float(limit_price)
+                
+            # Convert USD size to coin quantity
+            size = position_size_usd / limit_price
+            
+            # Round size to appropriate precision
+            # Most coins use different precision, implement proper rounding
+            if coin in ["BTC"]:
+                size = round(size, 4)  # 0.0001 BTC precision
+            elif coin in ["ETH"]:
+                size = round(size, 3)  # 0.001 ETH precision
+            else:
+                size = round(size, 2)  # 0.01 precision for others
+            
+            # Check minimum viable size
+            if size * limit_price < 5:  # $5 minimum order
+                return {"status": "rejected", "reason": "size_too_small",
+                        "message": f"Order size ${size * limit_price:.2f} below minimum $5"}
+            
+            # Place appropriate order type
+            if order_type == "market":
+                result = await self.place_market_order(coin, is_buy, size)
+            else:
+                result = await self.place_limit_order(coin, is_buy, size, limit_price)
+            
+            # Log order placement with full details
+            self.logger.info(f"Smart order placed: {coin} {'BUY' if is_buy else 'SELL'} "
+                          f"{size} @ ${limit_price} (${position_size_usd:.2f}, "
+                          f"risk: {risk_pct:.2%})")
+            
+            # Update risk management system
+            self.risk_manager.record_trade(coin, size * limit_price, is_buy)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error placing smart order: {e}")
             return {"status": "error", "message": str(e)}
 
-    async def profit_taking_strategy(self, coin: str, target_profit_pct: float = 0.02):
-        """Profit taking using market close from basic_market_order.py"""
+    async def update_correlation_matrix(self, coins: list = None):
+        """Update cross-coin correlation matrix"""
         try:
-            user_state = await self.engine.get_user_state()
+            current_time = time.time()
             
-            for position in user_state.get("positions", []):
-                if position["coin"] != coin or float(position["szi"]) == 0:
-                    continue
-                
-                szi = float(position["szi"])
-                entry_px = float(position["entryPx"])
-                
-                # Get current price
-                all_mids = self.engine.info.all_mids()
-                current_px = float(all_mids.get(coin, entry_px))
-                
-                # Calculate P&L
-                if szi > 0:  # Long position
-                    pnl_pct = (current_px - entry_px) / entry_px
-                elif szi < 0:  # Short position
-                    pnl_pct = (entry_px - current_px) / entry_px
-                else:
-                    continue
-                
-                if pnl_pct >= target_profit_pct:
-                    # Close position using market_close
-                    result = await self.engine.close_position(coin)
-                    self.logger.info(f"Profit taken on {coin}: {pnl_pct:.2%}")
-                    return {"action": "profit_taken", "pnl_pct": pnl_pct, "result": result}
+            # Update at most once every 4 hours
+            if current_time - self.last_correlation_update < 14400:
+                return self.correlation_matrix
             
-            return {"action": "monitoring", "message": "No profit taking needed"}
+            if not coins:
+                # Get all available coins
+                all_mids = self.info.all_mids()
+                coins = list(all_mids.keys())
+            
+            # Limit to common coins for performance
+            major_coins = [c for c in coins if c in ["BTC", "ETH", "SOL", "ARB", "AVAX", "APT", "OP", "MATIC", "DOGE"]]
+            
+            # Get price history for each coin
+            price_data = {}
+            for coin in major_coins:
+                try:
+                    candles = self.info.candles_snapshot(coin, "4h", 30)  # 5 days of 4-hour candles
+                    if len(candles) >= 10:  # Need reasonable amount of data
+                        price_data[coin] = [float(c["c"]) for c in candles]
+                except Exception:
+                    continue
+            
+            # Calculate correlation matrix
+            import numpy as np
+            correlation = {}
+            
+            for coin1 in price_data:
+                correlation[coin1] = {}
+                for coin2 in price_data:
+                    # Get common length
+                    min_len = min(len(price_data[coin1]), len(price_data[coin2]))
+                    if min_len < 10:
+                        correlation[coin1][coin2] = 0
+                        continue
+                    
+                    # Calculate returns
+                    returns1 = np.diff(price_data[coin1][-min_len:]) / price_data[coin1][-min_len:-1]
+                    returns2 = np.diff(price_data[coin2][-min_len:]) / price_data[coin2][-min_len:-1]
+                    
+                    # Calculate correlation
+                    try:
+                        corr = np.corrcoef(returns1, returns2)[0, 1]
+                        correlation[coin1][coin2] = corr
+                    except:
+                        correlation[coin1][coin2] = 0
+            
+            self.correlation_matrix = correlation
+            self.last_correlation_update = current_time
+            
+            self.logger.info(f"Updated correlation matrix for {len(correlation)} coins")
+            return correlation
             
         except Exception as e:
-            self.logger.error(f"Error in profit taking: {e}")
-            return {"action": "error", "message": str(e)}
+            self.logger.error(f"Error updating correlation matrix: {e}")
+            return {}
 
-    async def track_performance(self) -> Dict:
-        """Track performance using user_state from basic_order.py"""
+    async def find_correlated_opportunities(self, base_coin: str, correlation_threshold: float = 0.7):
+        """Find trading opportunities based on correlated coins"""
         try:
-            user_state = await self.engine.get_user_state()
-            margin_summary = user_state.get("marginSummary", {})
+            # Make sure correlation matrix is updated
+            await self.update_correlation_matrix()
             
-            account_value = float(margin_summary.get("accountValue", 0))
-            total_ntl_pos = float(margin_summary.get("totalNtlPos", 0))
-            total_raw_usd = float(margin_summary.get("totalRawUsd", 0))
+            if not self.correlation_matrix or base_coin not in self.correlation_matrix:
+                return []
             
-            # Get recent fills for detailed tracking
-            recent_fills = self.engine.info.user_fills(self.engine.address)
+            # Find coins with high correlation to base_coin
+            correlated_coins = []
+            for coin, corr in self.correlation_matrix[base_coin].items():
+                if coin != base_coin and abs(corr) >= correlation_threshold:
+                    correlated_coins.append({
+                        "coin": coin,
+                        "correlation": corr
+                    })
             
-            total_pnl = 0
-            total_fees = 0
-            trade_count = len(recent_fills)
+            # Get base coin performance
+            base_performance = await self._get_coin_performance(base_coin)
             
-            for fill in recent_fills:
-                total_pnl += float(fill.get("closedPnl", 0))
-                total_fees += float(fill.get("fee", 0))
+            # Find opportunities where base is up but correlated coin lags
+            opportunities = []
+            for coin_data in correlated_coins:
+                coin = coin_data["coin"]
+                corr = coin_data["correlation"]
+                
+                performance = await self._get_coin_performance(coin)
+                
+                # If coins are positively correlated
+                if corr > 0:
+                    # Base is up but correlated coin is lagging
+                    if base_performance["change_24h"] > 0.01 and performance["change_24h"] < base_performance["change_24h"] * 0.5:
+                        opportunities.append({
+                            "coin": coin,
+                            "signal": "BUY",
+                            "correlation": corr,
+                            "base_coin": base_coin,
+                            "base_change": base_performance["change_24h"],
+                            "coin_change": performance["change_24h"],
+                            "type": "positive_correlation_lag",
+                            "description": f"{coin} lagging behind {base_coin} despite positive correlation"
+                        })
+                    # Base is down but correlated coin hasn't fallen
+                    elif base_performance["change_24h"] < -0.01 and performance["change_24h"] > base_performance["change_24h"] * 0.5:
+                        opportunities.append({
+                            "coin": coin,
+                            "signal": "SELL",
+                            "correlation": corr,
+                            "base_coin": base_coin,
+                            "base_change": base_performance["change_24h"],
+                            "coin_change": performance["change_24h"],
+                            "type": "positive_correlation_drop_pending",
+                            "description": f"{coin} likely to follow {base_coin}'s decline"
+                        })
+                # If coins are negatively correlated
+                elif corr < 0:
+                    # Base is up, so negatively correlated should drop
+                    if base_performance["change_24h"] > 0.01 and performance["change_24h"] > -0.01:
+                        opportunities.append({
+                            "coin": coin,
+                            "signal": "SELL",
+                            "correlation": corr,
+                            "base_coin": base_coin,
+                            "base_change": base_performance["change_24h"],
+                            "coin_change": performance["change_24h"],
+                            "type": "negative_correlation_drop_expected",
+                            "description": f"{coin} likely to drop as {base_coin} rises (negative correlation)"
+                        })
+                    # Base is down, so negatively correlated should rise
+                    elif base_performance["change_24h"] < -0.01 and performance["change_24h"] < 0.01:
+                        opportunities.append({
+                            "coin": coin,
+                            "signal": "BUY",
+                            "correlation": corr,
+                            "base_coin": base_coin,
+                            "base_change": base_performance["change_24h"],
+                            "coin_change": performance["change_24h"],
+                            "type": "negative_correlation_rise_expected",
+                            "description": f"{coin} likely to rise as {base_coin} falls (negative correlation)"
+                        })
+            
+            return opportunities
+            
+        except Exception as e:
+            self.logger.error(f"Error finding correlation opportunities: {e}")
+            return []
+
+    async def _get_coin_performance(self, coin: str) -> dict:
+        """Get coin performance metrics"""
+        try:
+            # Get recent candles
+            candles = self.info.candles_snapshot(coin, "1h", 25)  # 24h + 1 for calculation
+            if len(candles) < 2:
+                return {"change_24h": 0, "volume_24h": 0}
+            
+            # Calculate 24h change
+            current_price = float(candles[-1]["c"])
+            price_24h_ago = float(candles[0]["c"])
+            change_24h = (current_price - price_24h_ago) / price_24h_ago
+            
+            # Calculate 24h volume
+            volume_24h = sum(float(c["v"]) for c in candles[1:])  # Skip first candle
             
             return {
-                "account_value": account_value,
-                "total_ntl_pos": total_ntl_pos,
-                "total_raw_usd": total_raw_usd,
-                "total_pnl": total_pnl,
-                "total_fees": total_fees,
-                "trade_count": trade_count,
-                "net_profit": total_pnl - total_fees,
-                "positions": user_state.get("positions", [])
+                "price": current_price,
+                "change_24h": change_24h,
+                "volume_24h": volume_24h
             }
             
         except Exception as e:
-            self.logger.error(f"Error tracking performance: {e}")
-            return {"error": str(e)}
+            self.logger.error(f"Error getting performance for {coin}: {e}")
+            return {"change_24h": 0, "volume_24h": 0}
+
+    async def execute_correlation_trade(self, opportunity):
+        """Execute trade based on correlation opportunity"""
+        try:
+            coin = opportunity["coin"]
+            signal = opportunity["signal"]
+            is_buy = signal == "BUY"
+            
+            # Use a smaller risk percentage for correlation trades
+            risk_pct = 0.005  # 0.5% of account
+            
+            # Place the trade with smart sizing
+            result = await self.place_smart_order(
+                coin=coin,
+                is_buy=is_buy,
+                risk_pct=risk_pct,
+                order_type="limit"
+            )
+            
+            # Log the correlation-based trade
+            self.logger.info(f"Correlation trade: {signal} {coin} based on {opportunity['type']}")
+            
+            return {
+                "status": "executed" if result.get("status") == "ok" else "failed",
+                "trade_result": result,
+                "opportunity": opportunity
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error executing correlation trade: {e}")
+            return {"status": "error", "message": str(e)}
+
+class RiskManagementSystem:
+    """Advanced risk management system for trading"""
+    
+    def __init__(self):
+        self.trade_limits = {
+            "daily_max_trades": 100,
+            "daily_max_volume": 100000,  # $100k per day
+            "max_drawdown_pct": 0.05,    # 5% max drawdown
+            "max_position_size": 10000,  # $10k max position
+            "max_open_positions": 10     # Maximum 10 open positions
+        }
+        
+        self.daily_trades = {}
+        self.daily_volumes = {}
+        self.drawdowns = {}
+        self.banned_coins = set()
+        self.position_limits = {}
+        self.trade_history = []
+        
+        self.logger = logging.getLogger(__name__)
+    
+    def can_trade(self, coin: str) -> bool:
+        """Check if trading is allowed for this coin"""
+        today = time.strftime("%Y-%m-%d")
+        
+        # Check banned coins
+        if coin in self.banned_coins:
+            return False
+        
+        # Check daily trade count
+        if today in self.daily_trades and self.daily_trades[today] >= self.trade_limits["daily_max_trades"]:
+            return False
+        
+        # Check daily volume
+        if today in self.daily_volumes and self.daily_volumes[today] >= self.trade_limits["daily_max_volume"]:
+            return False
+        
+        return True
+    
+    def get_risk_adjustment(self, coin: str) -> float:
+        """Get risk adjustment factor based on coin and market conditions"""
+        # Default is 1.0 (no adjustment)
+        adjustment = 1.0
+        
+        # If coin has had recent drawdowns, reduce risk
+        if coin in self.drawdowns and self.drawdowns[coin] > 0.02:  # 2%+ drawdown
+            adjustment *= 0.5  # Half risk
+        
+        # Reduce risk if we've had many trades today
+        today = time.strftime("%Y-%m-%d")
+        if today in self.daily_trades:
+            trades_factor = 1.0 - (self.daily_trades[today] / self.trade_limits["daily_max_trades"])
+            adjustment *= max(0.25, trades_factor)  # Reduce to at most 75%
+        
+        # Apply coin-specific limits
+        if coin in self.position_limits:
+            adjustment *= self.position_limits.get(coin, 1.0)
+        
+        return min(1.0, max(0.1, adjustment))  # Constrain between 0.1 and 1.0
+    
+    def record_trade(self, coin: str, trade_value: float, is_buy: bool):
+        """Record a trade for risk management tracking"""
+        today = time.strftime("%Y-%m-%d")
+        timestamp = time.time()
+        
+        # Update daily counters
+        if today not in self.daily_trades:
+            self.daily_trades[today] = 0
+            self.daily_volumes[today] = 0
+        
+        self.daily_trades[today] += 1
+        self.daily_volumes[today] += trade_value
+        
+        # Record in history
+        self.trade_history.append({
+            "timestamp": timestamp,
+            "coin": coin,
+            "value": trade_value,
+            "is_buy": is_buy
+        })
+        
+        # Limit history size
+        if len(self.trade_history) > 1000:
+            self.trade_history = self.trade_history[-1000:]
+        
+        self.logger.info(f"Trade recorded: {coin} {'BUY' if is_buy else 'SELL'} ${trade_value:.2f} "
+                       f"(daily: {self.daily_trades[today]}/{self.trade_limits['daily_max_trades']} trades, "
+                       f"${self.daily_volumes[today]:,.2f}/${self.trade_limits['daily_max_volume']:,.2f} volume)")
+
+    def update_drawdown(self, coin: str, drawdown_pct: float):
+        """Update drawdown tracking for a coin"""
+        self.drawdowns[coin] = drawdown_pct
+        
+        # Ban coin if drawdown exceeds threshold
+        if drawdown_pct > self.trade_limits["max_drawdown_pct"]:
+            self.banned_coins.add(coin)
+            self.logger.warning(f"{coin} banned due to {drawdown_pct:.2%} drawdown exceeding {self.trade_limits['max_drawdown_pct']:.2%} limit")
+    
+    def set_position_limit(self, coin: str, limit_factor: float):
+        """Set position size limit factor for a specific coin"""
+        self.position_limits[coin] = limit_factor
+    
+    def get_risk_report(self) -> dict:
+        """Get comprehensive risk report"""
+        today = time.strftime("%Y-%m-%d")
+        
+        return {
+            "daily_trades": self.daily_trades.get(today, 0),
+            "daily_volume": self.daily_volumes.get(today, 0),
+            "banned_coins": list(self.banned_coins),
+            "drawdowns": self.drawdowns,
+            "position_limits": self.position_limits,
+            "limits": self.trade_limits,
+            "risk_status": "normal" if self.daily_trades.get(today, 0) < self.trade_limits["daily_max_trades"] * 0.8 else "elevated"
+        }

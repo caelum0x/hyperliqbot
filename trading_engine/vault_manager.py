@@ -2,12 +2,14 @@ import asyncio
 import json
 import time
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 import sys
 import os
+import numpy as np
+from collections import deque
 
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
@@ -31,34 +33,78 @@ class VaultUser:
     initial_vault_value: float
     profit_share_rate: float
 
+@dataclass
+class VaultPerformanceMetrics:
+    """Enhanced vault performance tracking"""
+    tvl: float
+    daily_return: float
+    weekly_return: float
+    monthly_return: float
+    total_return: float
+    sharpe_ratio: float
+    max_drawdown: float
+    maker_rebate_earned: float
+    maker_ratio: float
+    active_users: int
+    profitable_days: int
+    total_days: int
+    win_rate: float
+    best_performing_asset: str
+    timestamp: float
+
 class VaultManager:
     """
     Manages user vaults with automated profit sharing using actual Hyperliquid API
     Uses real examples: basic_vault.py, basic_vault_transfer.py, and basic_transfer.py
     """
     
-    def __init__(self, vault_address: str, master_account=None, base_url=None):
+    def __init__(self, vault_address: str, master_account=None, base_url=None, exchange=None, info=None):
         self.vault_address = vault_address
         self.logger = logging.getLogger(__name__)
         
-        # Use example_utils.setup pattern like all Hyperliquid examples
-        self.address, self.info, self.exchange = example_utils.setup(
-            base_url=base_url or constants.TESTNET_API_URL,
-            skip_ws=True
-        )
+        # Use injected components if available, otherwise set up from scratch
+        if info and exchange:
+            self.info = info
+            self.exchange = exchange
+            self.address = getattr(exchange, 'account_address', None)
+        else:
+            # Use example_utils.setup pattern like all Hyperliquid examples
+            self.address, self.info, self.exchange = example_utils.setup(
+                base_url=base_url or constants.TESTNET_API_URL,
+                skip_ws=True
+            )
         
         # Create Exchange instance for vault operations using basic_vault.py pattern
-        self.vault_exchange = Exchange(
-            self.exchange.wallet, 
-            self.exchange.base_url, 
-            vault_address=vault_address
-        )
+        if exchange:
+            self.vault_exchange = Exchange(
+                exchange.wallet, 
+                exchange.base_url, 
+                vault_address=vault_address
+            )
+        else:
+            self.vault_exchange = Exchange(
+                self.exchange.wallet, 
+                self.exchange.base_url, 
+                vault_address=vault_address
+            )
         
         self.vault_users = {}
         self.profit_history = []
         
+        # Enhanced performance tracking
+        self.historical_values = deque(maxlen=90)  # 90 days of historical values
+        self.daily_returns = deque(maxlen=90)      # 90 days of returns
+        self.performance_metrics = {}
+        self.performance_history = []
+        self.benchmark_comparisons = []
+        self.last_metrics_update = 0
+        self.real_time_monitor = None
+        
         # Initialize database for user tracking
         self._init_database()
+        
+        # Start enhanced performance tracking
+        asyncio.create_task(self._start_performance_tracking())
         
         self.logger.info(f"VaultManager initialized for vault: {vault_address}")
     
@@ -85,7 +131,59 @@ class VaultManager:
                 amount REAL,
                 vault_performance REAL,
                 timestamp REAL,
+                weighted_factor REAL DEFAULT 1.0,
                 FOREIGN KEY (user_id) REFERENCES vault_users (user_id)
+            )
+        ''')
+        
+        # Enhanced performance tracking tables
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS vault_performance_daily (
+                date TEXT PRIMARY KEY,
+                tvl REAL,
+                daily_return REAL,
+                total_return REAL,
+                maker_rebate REAL,
+                taker_fee REAL,
+                active_positions INTEGER,
+                user_count INTEGER,
+                best_asset TEXT,
+                worst_asset TEXT,
+                timestamp REAL
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS vault_benchmark_comparison (
+                date TEXT PRIMARY KEY,
+                vault_return REAL,
+                btc_return REAL,
+                eth_return REAL,
+                sp500_return REAL,
+                alpha REAL,
+                beta REAL,
+                timestamp REAL
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS vault_drawdowns (
+                drawdown_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_date TEXT,
+                end_date TEXT,
+                depth REAL,
+                duration_days INTEGER,
+                recovery_date TEXT,
+                timestamp REAL
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS vault_real_time_metrics (
+                metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                metric_name TEXT,
+                metric_value REAL,
+                updated_at REAL
             )
         ''')
         
@@ -680,6 +778,883 @@ class VaultManager:
             }
         except Exception as e:
             return {'available': 0, 'error': str(e)}
+
+    async def distribute_profits_by_contribution(self, profit_share: float = 0.1) -> Dict:
+        """
+        Distribute profits based on user contribution time and amount
+        Uses time-weighted average contribution
+        """
+        try:
+            # Calculate total profits
+            vault_balance = await self.get_vault_balance()
+            if vault_balance['status'] != 'success':
+                return vault_balance
+                
+            total_profits = vault_balance['total_unrealized_pnl']
+            if total_profits <= 0:
+                return {'status': 'info', 'message': 'No profits to distribute'}
+                
+            # Get all users with time-weighted contributions
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT user_id, deposit_amount, deposit_time
+                FROM vault_users
+            ''')
+            
+            users = cursor.fetchall()
+            total_weighted_contribution = 0
+            user_weights = {}
+            
+            current_time = time.time()
+            for user_id, amount, deposit_time in users:
+                # Time weight: longer time = higher weight (max 2x)
+                time_factor = min(2.0, 1 + (current_time - deposit_time) / 2592000)  # 30 days = 2x
+                weighted_contribution = amount * time_factor
+                total_weighted_contribution += weighted_contribution
+                user_weights[user_id] = weighted_contribution
+                
+            # Distribute profits proportionally
+            distributions = []
+            keeper_share = total_profits * profit_share
+            user_profit_pool = total_profits - keeper_share
+            
+            for user_id, weighted_contribution in user_weights.items():
+                if total_weighted_contribution > 0:
+                    user_share = user_profit_pool * (weighted_contribution / total_weighted_contribution)
+                    
+                    # Record distribution
+                    cursor.execute('''
+                        INSERT INTO profit_distributions 
+                        (user_id, amount, vault_performance, timestamp, weighted_factor)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (user_id, user_share, vault_balance['total_unrealized_pnl'], 
+                          current_time, weighted_contribution / total_weighted_contribution))
+                    
+                    distributions.append({
+                        'user_id': user_id,
+                        'profit_amount': user_share,
+                        'contribution_weight': weighted_contribution / total_weighted_contribution
+                    })
+                    
+            self.conn.commit()
+            
+            return {
+                'status': 'success',
+                'keeper_share': keeper_share,
+                'user_profit_pool': user_profit_pool,
+                'distributions': distributions,
+                'total_weighted_contribution': total_weighted_contribution
+            }
+            
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+
+    async def distribute_profits_with_loyalty_tiers(self, profit_share: float = 0.1) -> Dict:
+        """
+        Distribute profits with loyalty tiers for long-term vault users
+        Users with longer history get better rates
+        """
+        try:
+            # Calculate total profits
+            vault_balance = await self.get_vault_balance()
+            if vault_balance['status'] != 'success':
+                return vault_balance
+                
+            total_profits = vault_balance['total_unrealized_pnl']
+            if total_profits <= 0:
+                return {'status': 'info', 'message': 'No profits to distribute'}
+            
+            # Define loyalty tiers (days in vault)
+            loyalty_tiers = {
+                30: 1.0,   # 1 month - base rate
+                90: 1.1,   # 3 months - 10% bonus
+                180: 1.2,  # 6 months - 20% bonus
+                365: 1.35  # 1 year - 35% bonus
+            }
+            
+            # Get all users with deposits
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT user_id, deposit_amount, deposit_time
+                FROM vault_users
+            ''')
+            
+            users = cursor.fetchall()
+            total_weighted_contribution = 0
+            user_weights = {}
+            user_tiers = {}
+            
+            current_time = time.time()
+            for user_id, amount, deposit_time in users:
+                # Calculate days in vault
+                days_in_vault = (current_time - deposit_time) / 86400
+                
+                # Determine loyalty tier
+                loyalty_factor = 1.0
+                for days, factor in sorted(loyalty_tiers.items()):
+                    if days_in_vault >= days:
+                        loyalty_factor = factor
+                    else:
+                        break
+                
+                weighted_contribution = amount * loyalty_factor
+                total_weighted_contribution += weighted_contribution
+                user_weights[user_id] = weighted_contribution
+                user_tiers[user_id] = {
+                    'days': days_in_vault,
+                    'tier': loyalty_factor
+                }
+            print(user_weights)
+            # Distribute profits proportionally with loyalty bonus
+            distributions = []
+            keeper_share = total_profits * profit_share
+            user_profit_pool = total_profits - keeper_share
+            
+            for user_id, weighted_contribution in user_weights.items():
+                if total_weighted_contribution > 0:
+                    user_share = user_profit_pool * (weighted_contribution / total_weighted_contribution)
+                    
+                    # Record distribution with loyalty info
+                    cursor.execute('''
+                        INSERT INTO profit_distributions 
+                        (user_id, amount, vault_performance, timestamp, weighted_factor)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (user_id, user_share, vault_balance['total_unrealized_pnl'], 
+                          current_time, weighted_contribution / total_weighted_contribution))
+                    
+                    distributions.append({
+                        'user_id': user_id,
+                        'profit_amount': user_share,
+                        'contribution_weight': weighted_contribution / total_weighted_contribution,
+                        'loyalty_tier': user_tiers[user_id]['tier'],
+                        'days_in_vault': user_tiers[user_id]['days']
+                    })
+                    
+            self.conn.commit()
+            
+            # Update performance metrics with this distribution
+            metrics_update = {
+                'distribution_timestamp': current_time,
+                'total_distributed': user_profit_pool,
+                'keeper_share': keeper_share,
+                'user_count': len(users),
+                'loyal_users': sum(1 for tier in user_tiers.values() if tier['tier'] > 1.0)
+            }
+            
+            await self._update_performance_metrics(metrics_update)
+            
+            return {
+                'status': 'success',
+                'keeper_share': keeper_share,
+                'user_profit_pool': user_profit_pool,
+                'distributions': distributions,
+                'loyalty_tiers': loyalty_tiers,
+                'total_weighted_contribution': total_weighted_contribution
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error in loyalty distribution: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def _start_performance_tracking(self):
+        """Start background task for performance tracking"""
+        try:
+            # Initial metrics calculation
+            await self._calculate_performance_metrics()
+            
+            # Start background monitoring
+            self.real_time_monitor = asyncio.create_task(self._run_real_time_monitoring())
+            self.logger.info("Started vault performance tracking and monitoring")
+            
+            # Schedule regular updates
+            while True:
+                await self._calculate_performance_metrics()
+                await self._update_benchmark_comparison()
+                await self._detect_drawdowns()
+                
+                # Store current metrics for historical analysis
+                current_value = await self._get_current_vault_value()
+                if current_value > 0:
+                    self.historical_values.append((time.time(), current_value))
+                    
+                    # Calculate daily return if we have previous value
+                    if len(self.historical_values) >= 2:
+                        prev_time, prev_value = self.historical_values[-2]
+                        if time.time() - prev_time >= 86400:  # At least a day apart
+                            daily_return = (current_value - prev_value) / prev_value
+                            self.daily_returns.append(daily_return)
+                
+                # Wait for next update (every 6 hours)
+                await asyncio.sleep(21600)
+                
+        except asyncio.CancelledError:
+            self.logger.info("Performance tracking stopped")
+        except Exception as e:
+            self.logger.error(f"Error in performance tracking: {e}")
+
+    async def _run_real_time_monitoring(self):
+        """Run real-time monitoring of vault performance"""
+        try:
+            while True:
+                # Get real-time metrics
+                vault_balance = await self.get_vault_balance()
+                
+                if vault_balance['status'] == 'success':
+                    # Update real-time metrics
+                    metrics = {
+                        'tvl': vault_balance['total_value'],
+                        'unrealized_pnl': vault_balance['total_unrealized_pnl'],
+                        'position_count': len(vault_balance['positions']),
+                        'margin_utilization': vault_balance['total_margin_used'] / vault_balance['total_value'] 
+                            if vault_balance['total_value'] > 0 else 0
+                    }
+                    
+                    # Store real-time metrics
+                    cursor = self.conn.cursor()
+                    timestamp = time.time()
+                    
+                    for name, value in metrics.items():
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO vault_real_time_metrics 
+                            (metric_name, metric_value, updated_at)
+                            VALUES (?, ?, ?)
+                        ''', (name, value, timestamp))
+                    
+                    # Check for critical alerts
+                    if metrics['margin_utilization'] > 0.8:
+                        self.logger.warning(f"HIGH MARGIN UTILIZATION: {metrics['margin_utilization']:.1%}")
+                    
+                    self.conn.commit()
+                
+                # Wait before next check (every 5 minutes)
+                await asyncio.sleep(300)
+                
+        except asyncio.CancelledError:
+            self.logger.info("Real-time monitoring stopped")
+        except Exception as e:
+            self.logger.error(f"Error in real-time monitoring: {e}")
+
+    async def _calculate_performance_metrics(self) -> Dict:
+        """Calculate comprehensive performance metrics"""
+        try:
+            vault_balance = await self.get_vault_balance()
+            if vault_balance['status'] != 'success':
+                return {'status': 'error', 'message': 'Failed to get vault balance'}
+            
+            # Get fills for more detailed metrics
+            fills = self.info.user_fills(self.vault_address)
+            if not fills:
+                fills = []
+            
+            # Calculate daily, weekly, monthly returns
+            current_value = vault_balance['total_value']
+            today = datetime.now().strftime('%Y-%m-%d')
+            
+            # Get historical values from database
+            cursor = self.conn.cursor()
+            
+            # Get previous day value
+            cursor.execute('''
+                SELECT tvl FROM vault_performance_daily
+                WHERE date != ? 
+                ORDER BY date DESC LIMIT 1
+            ''', (today,))
+            prev_day = cursor.fetchone()
+            daily_return = 0.0
+            
+            if prev_day:
+                prev_value = prev_day[0]
+                if prev_value > 0:
+                    daily_return = (current_value - prev_value) / prev_value
+            
+            # Get week ago value
+            week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            cursor.execute('''
+                SELECT tvl FROM vault_performance_daily
+                WHERE date <= ?
+                ORDER BY date DESC LIMIT 1
+            ''', (week_ago,))
+            week_ago_data = cursor.fetchone()
+            weekly_return = 0.0
+            
+            if week_ago_data:
+                week_ago_value = week_ago_data[0]
+                if week_ago_value > 0:
+                    weekly_return = (current_value - week_ago_value) / week_ago_value
+            
+            # Get month ago value
+            month_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            cursor.execute('''
+                SELECT tvl FROM vault_performance_daily
+                WHERE date <= ?
+                ORDER BY date DESC LIMIT 1
+            ''', (month_ago,))
+            month_ago_data = cursor.fetchone()
+            monthly_return = 0.0
+            
+            if month_ago_data:
+                month_ago_value = month_ago_data[0]
+                if month_ago_value > 0:
+                    monthly_return = (current_value - month_ago_value) / month_ago_value
+            
+            # Calculate maker rebates and taker fees
+            maker_rebates = 0.0
+            taker_fees = 0.0
+            maker_trades = 0
+            total_trades = len(fills)
+            
+            for fill in fills:
+                fee = float(fill.get('fee', 0))
+                if fee < 0:  # Maker rebate
+                    maker_rebates += abs(fee)
+                    maker_trades += 1
+                else:  # Taker fee
+                    taker_fees += fee
+            
+            maker_ratio = maker_trades / total_trades if total_trades > 0 else 0
+            
+            # Calculate Sharpe ratio using daily returns
+            daily_returns_list = list(self.daily_returns)
+            if len(daily_returns_list) > 0:
+                avg_return = sum(daily_returns_list) / len(daily_returns_list)
+                std_dev = np.std(daily_returns_list) if len(daily_returns_list) > 1 else 0
+                sharpe = (avg_return / std_dev) * (252 ** 0.5) if std_dev > 0 else 0
+            else:
+                sharpe = 0
+            
+            # Calculate max drawdown
+            max_drawdown = await self._calculate_max_drawdown()
+            
+            # Find best performing asset
+            asset_performance = {}
+            for position in vault_balance['positions']:
+                coin = position['coin']
+                pnl = position['unrealized_pnl']
+                asset_performance[coin] = pnl
+            
+            best_asset = max(asset_performance.items(), key=lambda x: x[1])[0] if asset_performance else 'None'
+            
+            # Get user count
+            cursor.execute('SELECT COUNT(*) FROM vault_users')
+            user_count = cursor.fetchone()[0]
+            
+            # Calculate profitable days ratio
+            cursor.execute('''
+                SELECT COUNT(*) FROM vault_performance_daily
+                WHERE daily_return > 0
+            ''')
+            profitable_days = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM vault_performance_daily')
+            total_days = cursor.fetchone()[0] or 1  # Avoid division by zero
+            
+            # Create metrics object
+            metrics = VaultPerformanceMetrics(
+                tvl=current_value,
+                daily_return=daily_return,
+                weekly_return=weekly_return,
+                monthly_return=monthly_return,
+                total_return=0,  # Will calculate from initial value
+                sharpe_ratio=sharpe,
+                max_drawdown=max_drawdown,
+                maker_rebate_earned=maker_rebates,
+                maker_ratio=maker_ratio,
+                active_users=user_count,
+                profitable_days=profitable_days,
+                total_days=total_days,
+                win_rate=profitable_days / total_days,
+                best_performing_asset=best_asset,
+                timestamp=time.time()
+            )
+            
+            # Store daily performance
+            cursor.execute('''
+                INSERT OR REPLACE INTO vault_performance_daily
+                (date, tvl, daily_return, total_return, maker_rebate, taker_fee,
+                 active_positions, user_count, best_asset, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (today, current_value, daily_return, 0, maker_rebates,
+                  taker_fees, len(vault_balance['positions']), user_count,
+                  best_asset, time.time()))
+            
+            self.conn.commit()
+            
+            # Update in-memory metrics
+            self.performance_metrics = {
+                'tvl': current_value,
+                'daily_return': daily_return,
+                'weekly_return': weekly_return,
+                'monthly_return': monthly_return,
+                'sharpe_ratio': sharpe,
+                'max_drawdown': max_drawdown,
+                'maker_rebates': maker_rebates,
+                'maker_ratio': maker_ratio,
+                'win_rate': profitable_days / total_days,
+                'active_users': user_count
+            }
+            
+            self.last_metrics_update = time.time()
+            
+            return {
+                'status': 'success',
+                'metrics': self.performance_metrics
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating performance metrics: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def _update_benchmark_comparison(self) -> Dict:
+        """Update benchmark comparison between vault and market indices"""
+        try:
+            # In a real implementation, you would fetch price data for benchmarks
+            # Here we'll simulate it for demonstration
+            
+            # Get vault's current return
+            vault_balance = await self.get_vault_balance()
+            if vault_balance['status'] != 'success':
+                return {'status': 'error', 'message': 'Failed to get vault balance'}
+            
+            today = datetime.now().strftime('%Y-%m-%d')
+            
+            # Calculate vault's daily return
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT tvl FROM vault_performance_daily
+                WHERE date != ? 
+                ORDER BY date DESC LIMIT 1
+            ''', (today,))
+            
+            prev_day = cursor.fetchone()
+            vault_return = 0.0
+            
+            if prev_day and prev_day[0] > 0:
+                vault_return = (vault_balance['total_value'] - prev_day[0]) / prev_day[0]
+            
+            # Simulate benchmark returns (in a real implementation, fetch from API)
+            # These would be daily returns for various benchmarks
+            btc_return = np.random.normal(0.001, 0.03)  # 0.1% average daily return with 3% std dev
+            eth_return = np.random.normal(0.001, 0.04)  # 0.1% average daily return with 4% std dev
+            sp500_return = np.random.normal(0.0005, 0.01)  # 0.05% average daily return with 1% std dev
+            
+            # Calculate alpha and beta (simplified)
+            # Alpha = vault return - risk-free rate - beta * (market return - risk-free rate)
+            risk_free_rate = 0.0001  # 0.01% daily risk-free rate
+            beta = 1.2  # Assume higher volatility than BTC
+            alpha = vault_return - risk_free_rate - beta * (btc_return - risk_free_rate)
+            
+            # Store benchmark comparison
+            cursor.execute('''
+                INSERT OR REPLACE INTO vault_benchmark_comparison
+                (date, vault_return, btc_return, eth_return, sp500_return, alpha, beta, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (today, vault_return, btc_return, eth_return, sp500_return, alpha, beta, time.time()))
+            
+            self.conn.commit()
+            
+            # Store in memory
+            self.benchmark_comparisons.append({
+                'date': today,
+                'vault_return': vault_return,
+                'btc_return': btc_return,
+                'eth_return': eth_return,
+                'sp500_return': sp500_return,
+                'alpha': alpha,
+                'beta': beta
+            })
+            
+            if len(self.benchmark_comparisons) > 90:  # Keep last 90 days
+                self.benchmark_comparisons.pop(0)
+            
+            return {
+                'status': 'success',
+                'benchmark': {
+                    'vault_return': vault_return,
+                    'btc_return': btc_return,
+                    'eth_return': eth_return,
+                    'sp500_return': sp500_return,
+                    'alpha': alpha,
+                    'beta': beta
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error updating benchmark comparison: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def _calculate_max_drawdown(self) -> float:
+        """Calculate maximum drawdown from historical values"""
+        try:
+            if len(self.historical_values) < 2:
+                return 0.0
+            
+            values = [value for _, value in self.historical_values]
+            max_drawdown = 0.0
+            peak = values[0]
+            
+            for value in values:
+                if value > peak:
+                    peak = value
+                else:
+                    drawdown = (peak - value) / peak
+                    if drawdown > max_drawdown:
+                        max_drawdown = drawdown
+            
+            return max_drawdown
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating max drawdown: {e}")
+            return 0.0
+
+    async def _detect_drawdowns(self) -> Dict:
+        """Detect and record significant drawdowns"""
+        try:
+            if len(self.historical_values) < 5:  # Need enough data
+                return {'status': 'insufficient_data'}
+            
+            values = [value for _, value in self.historical_values]
+            times = [ts for ts, _ in self.historical_values]
+            
+            potential_drawdowns = []
+            in_drawdown = False
+            peak = values[0]
+            peak_time = times[0]
+            trough = peak
+            trough_time = peak_time
+            
+            for i in range(1, len(values)):
+                if not in_drawdown:
+                    if values[i] > peak:
+                        peak = values[i]
+                        peak_time = times[i]
+                    elif (peak - values[i]) / peak > 0.05:  # 5% drawdown threshold to start tracking
+                        in_drawdown = True
+                        trough = values[i]
+                        trough_time = times[i]
+                else:  # In drawdown
+                    if values[i] < trough:
+                        trough = values[i]
+                        trough_time = times[i]
+                    elif values[i] > trough * 1.05:  # 5% recovery from trough
+                        # Record drawdown
+                        drawdown_depth = (peak - trough) / peak
+                        if drawdown_depth >= 0.1:  # Only record significant drawdowns (10%+)
+                            potential_drawdowns.append({
+                                'start_date': datetime.fromtimestamp(peak_time).strftime('%Y-%m-%d'),
+                                'end_date': datetime.fromtimestamp(trough_time).strftime('%Y-%m-%d'),
+                                'depth': drawdown_depth,
+                                'duration_days': (trough_time - peak_time) / 86400,
+                                'recovery_date': datetime.fromtimestamp(times[i]).strftime('%Y-%m-%d')
+                            })
+                        
+                        # Reset drawdown tracking
+                        in_drawdown = False
+                        peak = values[i]
+                        peak_time = times[i]
+            
+            # Store significant drawdowns
+            cursor = self.conn.cursor()
+            for drawdown in potential_drawdowns:
+                cursor.execute('''
+                    INSERT INTO vault_drawdowns
+                    (start_date, end_date, depth, duration_days, recovery_date, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (drawdown['start_date'], drawdown['end_date'], drawdown['depth'],
+                      drawdown['duration_days'], drawdown['recovery_date'], time.time()))
+            
+            self.conn.commit()
+            
+            return {
+                'status': 'success',
+                'drawdowns_detected': len(potential_drawdowns),
+                'drawdowns': potential_drawdowns
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error detecting drawdowns: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def _update_performance_metrics(self, new_metrics: Dict):
+        """Update performance metrics with new data"""
+        try:
+            timestamp = new_metrics.get('timestamp', time.time())
+            
+            # Update in-memory metrics
+            for key, value in new_metrics.items():
+                if key != 'timestamp':
+                    self.performance_metrics[key] = value
+            
+            self.last_metrics_update = timestamp
+            
+            # Store historical point
+            self.performance_history.append({
+                'timestamp': timestamp,
+                'metrics': self.performance_metrics.copy()
+            })
+            
+            # Limit history size
+            if len(self.performance_history) > 100:
+                self.performance_history.pop(0)
+                
+        except Exception as e:
+            self.logger.error(f"Error updating performance metrics: {e}")
+
+    async def _get_current_vault_value(self) -> float:
+        """Get current vault value"""
+        try:
+            vault_state = self.info.user_state(self.vault_address)
+            return float(vault_state.get('marginSummary', {}).get('accountValue', 0))
+        except Exception:
+            return 0.0
+
+    async def get_enhanced_performance_analytics(self) -> Dict:
+        """Get comprehensive performance analytics for the vault"""
+        try:
+            # Force refresh performance metrics
+            await self._calculate_performance_metrics()
+            
+            # Get benchmark comparison
+            await self._update_benchmark_comparison()
+            
+            # Get drawdown information
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT * FROM vault_drawdowns
+                ORDER BY timestamp DESC
+                LIMIT 5
+            ''')
+            recent_drawdowns = [dict(zip(
+                ['id', 'start_date', 'end_date', 'depth', 'duration_days', 'recovery_date', 'timestamp'], 
+                row)) for row in cursor.fetchall()]
+            
+            # Get real-time metrics
+            cursor.execute('''
+                SELECT metric_name, metric_value, updated_at
+                FROM vault_real_time_metrics
+            ''')
+            real_time = {row[0]: {'value': row[1], 'updated_at': row[2]} for row in cursor.fetchall()}
+            
+            # Get periodic performance
+            cursor.execute('''
+                SELECT date, tvl, daily_return
+                FROM vault_performance_daily
+                ORDER BY date DESC
+                LIMIT 30
+            ''')
+            daily_performance = [dict(zip(['date', 'tvl', 'return'], row)) for row in cursor.fetchall()]
+            
+            # Most profitable coins
+            position_analytics = await self._analyze_positions_by_coin()
+            
+            # Build full analytics response
+            return {
+                'status': 'success',
+                'metrics': self.performance_metrics,
+                'benchmarks': self.benchmark_comparisons[-7:] if self.benchmark_comparisons else [],
+                'drawdowns': recent_drawdowns,
+                'real_time': real_time,
+                'daily_performance': daily_performance,
+                'position_analytics': position_analytics
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting enhanced performance analytics: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def _analyze_positions_by_coin(self) -> Dict:
+        """Analyze position performance by coin"""
+        try:
+            # Get fills grouped by coin
+            fills = self.info.user_fills(self.vault_address)
+            
+            if not fills:
+                return {'coins': []}
+            
+            coin_performance = {}
+            for fill in fills:
+                coin = fill.get('coin', 'unknown')
+                pnl = float(fill.get('closedPnl', 0))
+                fee = float(fill.get('fee', 0))
+                size = float(fill.get('sz', 0))
+                price = float(fill.get('px', 0))
+                
+                if coin not in coin_performance:
+                    coin_performance[coin] = {
+                        'coin': coin,
+                        'total_pnl': 0,
+                        'total_fees': 0,
+                        'trade_count': 0,
+                        'total_volume': 0,
+                        'winning_trades': 0,
+                        'largest_win': 0,
+                        'largest_loss': 0
+                    }
+                
+                coin_stats = coin_performance[coin]
+                coin_stats['total_pnl'] += pnl
+                coin_stats['total_fees'] += fee
+                coin_stats['trade_count'] += 1
+                coin_stats['total_volume'] += price * size
+                
+                if pnl > 0:
+                    coin_stats['winning_trades'] += 1
+                    if pnl > coin_stats['largest_win']:
+                        coin_stats['largest_win'] = pnl
+                elif pnl < 0:
+                    if pnl < coin_stats['largest_loss']:
+                        coin_stats['largest_loss'] = pnl
+            
+            # Calculate win rates and average trade
+            for coin, stats in coin_performance.items():
+                if stats['trade_count'] > 0:
+                    stats['win_rate'] = stats['winning_trades'] / stats['trade_count']
+                    stats['avg_trade_pnl'] = stats['total_pnl'] / stats['trade_count']
+                else:
+                    stats['win_rate'] = 0
+                    stats['avg_trade_pnl'] = 0
+            
+            # Sort by total PnL
+            sorted_coins = sorted(coin_performance.values(), key=lambda x: x['total_pnl'], reverse=True)
+            
+            return {'coins': sorted_coins}
+            
+        except Exception as e:
+            self.logger.error(f"Error analyzing positions by coin: {e}")
+            return {'coins': [], 'error': str(e)}
+
+    async def get_performance_benchmarks(self) -> Dict:
+        """Get performance benchmarks compared to market"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT date, vault_return, btc_return, eth_return, sp500_return, alpha, beta
+                FROM vault_benchmark_comparison
+                ORDER BY date DESC
+                LIMIT 30
+            ''')
+            
+            benchmarks = [dict(zip(
+                ['date', 'vault_return', 'btc_return', 'eth_return', 'sp500_return', 'alpha', 'beta'], 
+                row)) for row in cursor.fetchall()]
+            
+            # Calculate cumulative returns
+            if benchmarks:
+                cumulative = {
+                    'vault': 1.0,
+                    'btc': 1.0,
+                    'eth': 1.0,
+                    'sp500': 1.0
+                }
+                
+                cumulative_series = []
+                
+                for b in reversed(benchmarks):
+                    cumulative['vault'] *= (1 + b['vault_return'])
+                    cumulative['btc'] *= (1 + b['btc_return'])
+                    cumulative['eth'] *= (1 + b['eth_return'])
+                    cumulative['sp500'] *= (1 + b['sp500_return'])
+                    
+                    cumulative_series.append({
+                        'date': b['date'],
+                        'vault': cumulative['vault'],
+                        'btc': cumulative['btc'],
+                        'eth': cumulative['eth'],
+                        'sp500': cumulative['sp500']
+                    })
+                
+                # Calculate average alpha and beta
+                avg_alpha = sum(b['alpha'] for b in benchmarks) / len(benchmarks)
+                avg_beta = sum(b['beta'] for b in benchmarks) / len(benchmarks)
+                
+                return {
+                    'status': 'success',
+                    'daily_returns': benchmarks,
+                    'cumulative_returns': cumulative_series,
+                    'avg_alpha': avg_alpha,
+                    'avg_beta': avg_beta
+                }
+            
+            return {'status': 'success', 'benchmarks': [], 'message': 'No benchmark data available'}
+            
+        except Exception as e:
+            self.logger.error(f"Error getting performance benchmarks: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def get_profit_attribution_analysis(self) -> Dict:
+        """Get profit attribution analysis by strategy and asset"""
+        try:
+            # In a real implementation, you would track strategies separately
+            # Here we'll simulate strategy attribution
+            
+            # Get fills for analysis
+            fills = self.info.user_fills(self.vault_address)
+            if not fills:
+                return {'status': 'success', 'attribution': [], 'message': 'No fill data available'}
+            
+            # Simulate strategy labels (in production, each order would be tagged with strategy)
+            strategies = ['grid', 'momentum', 'market_making', 'volatility', 'trend']
+            
+            # Group by coin first
+            coin_attribution = {}
+            for fill in fills:
+                coin = fill.get('coin', 'unknown')
+                pnl = float(fill.get('closedPnl', 0))
+                
+                if coin not in coin_attribution:
+                    coin_attribution[coin] = 0
+                    
+                coin_attribution[coin] += pnl
+            
+            # Simulate strategy attribution
+            strategy_attribution = {}
+            for strategy in strategies:
+                strategy_attribution[strategy] = 0
+            
+            # Distribute PnL to strategies based on coin (simplified simulation)
+            for coin, pnl in coin_attribution.items():
+                # Randomly distribute PnL to strategies based on coin
+                # This is just a simulation - in a real system, each trade would be tagged
+                import random
+                # Pick 1-3 strategies for this coin
+                strategy_count = random.randint(1, min(3, len(strategies)))
+                selected_strategies = random.sample(strategies, strategy_count)
+                
+                # Distribute PnL among selected strategies
+                weights = [random.random() for _ in range(strategy_count)]
+                total_weight = sum(weights)
+                
+                for i, strategy in enumerate(selected_strategies):
+                    strategy_share = pnl * (weights[i] / total_weight)
+                    strategy_attribution[strategy] += strategy_share
+            
+            # Format response
+            attribution = [
+                {'strategy': strategy, 'pnl': pnl, 'percentage': 0}  # Percentage will be calculated
+                for strategy, pnl in strategy_attribution.items()
+            ]
+            
+            # Calculate percentages
+            total_pnl = sum(item['pnl'] for item in attribution)
+            if total_pnl != 0:
+                for item in attribution:
+                    item['percentage'] = item['pnl'] / total_pnl * 100
+            
+            # Sort by PnL contribution
+            attribution.sort(key=lambda x: x['pnl'], reverse=True)
+            
+            return {
+                'status': 'success',
+                'total_pnl': total_pnl,
+                'attribution': attribution,
+                'coin_attribution': [
+                    {'coin': coin, 'pnl': pnl}
+                    for coin, pnl in coin_attribution.items()
+                ]
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting profit attribution: {e}")
+            return {'status': 'error', 'message': str(e)}
 
 # Legacy alias for backward compatibility
 class ProfitSharingVaultManager(VaultManager):

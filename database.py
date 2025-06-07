@@ -129,11 +129,96 @@ class Database:
             )
         """)
         
+        # Enhanced performance tracking tables
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS maker_rebate_performance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                coin TEXT,
+                timestamp REAL,
+                maker_volume REAL,
+                total_volume REAL,
+                rebate_earned REAL,
+                maker_percentage REAL,
+                efficiency_score REAL,
+                FOREIGN KEY (user_id) REFERENCES users (telegram_id)
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS vault_user_performance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                vault_address TEXT,
+                date TEXT,
+                share_percentage REAL,
+                profit_share REAL,
+                performance_fee_paid REAL,
+                cumulative_profit REAL,
+                roi_daily REAL,
+                volume_contribution REAL,
+                FOREIGN KEY (user_id) REFERENCES users (telegram_id)
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_performance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_name TEXT,
+                coin TEXT,
+                timestamp REAL,
+                entry_price REAL,
+                exit_price REAL,
+                position_size REAL,
+                pnl REAL,
+                duration_minutes INTEGER,
+                win_rate REAL,
+                sharpe_ratio REAL,
+                max_drawdown REAL
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS market_analytics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin TEXT,
+                timestamp REAL,
+                mid_price REAL,
+                spread_bps REAL,
+                volume_1h REAL,
+                volatility_1h REAL,
+                orderbook_imbalance REAL,
+                maker_rebate_opportunity REAL,
+                trend_signal TEXT
+            )
+        """)
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_trading_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                date TEXT,
+                total_trades INTEGER,
+                maker_trades INTEGER,
+                avg_trade_size REAL,
+                most_traded_coin TEXT,
+                peak_trading_hour INTEGER,
+                trading_frequency_score REAL,
+                risk_score REAL,
+                FOREIGN KEY (user_id) REFERENCES users (telegram_id)
+            )
+        """)
+        
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_withdrawals_user ON withdrawals(user_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_maker_rebate_user_coin ON maker_rebate_performance(user_id, coin)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_vault_user_perf_date ON vault_user_performance(date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_strategy_perf_name ON strategy_performance(strategy_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_market_analytics_coin ON market_analytics(coin, timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_patterns_date ON user_trading_patterns(date)")
         
         self.connection.commit()
     
