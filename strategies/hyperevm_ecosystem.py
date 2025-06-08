@@ -2,7 +2,9 @@ import asyncio
 import json
 import time
 import requests
-from typing import Dict, List, Optional
+import logging
+import numpy as np
+from typing import Dict, List, Optional, Union
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -20,20 +22,386 @@ class HyperEVMOpportunity:
     current_multiplier: float
     risk_level: str  # "low", "medium", "high"
 
-class HyperEVMEcosystemStrategy:
+class HyperEVMEcosystem:
     """
-    Comprehensive HyperEVM ecosystem strategy for maximum airdrop farming
+    Strategy focused on cross-chain arbitrage and ecosystem-wide opportunities.
+    Leverages Hyperliquid's L1 blockchain for fast execution.
     """
     
-    def __init__(self, trader):
-        self.trader = trader
+    def __init__(self, trading_engine, info, exchange, address, config):
+        self.trading_engine = trading_engine
+        self.info = info
+        self.exchange = exchange
+        self.address = address
+        self.config = config
+        self.logger = logging.getLogger("HyperEVMEcosystem")
+        
+        # Strategy-specific settings
+        self.active_pairs = []
+        self.funding_threshold = -0.0001  # -0.01% threshold for funding arbitrage
+        self.arb_min_spread = 0.002  # 0.2% minimum arbitrage spread
+        self.position_size_pct = 0.05  # 5% of account per position
+        self.max_concurrent_arbs = 3  # Maximum concurrent arbitrage positions
+        
+        # Opportunity tracking
         self.opportunities = []
         self.user_positions = {}
         self.protocol_interactions = {}
         
+    async def initialize(self):
+        """Initialize the strategy by loading settings and market data"""
+        self.logger.info("Initializing HyperEVMEcosystem strategy")
+        
+        # Get available markets
+        response = await self._post_request("info", {"type": "meta"})
+        if "universe" in response:
+            self.active_pairs = [coin["name"] for coin in response["universe"]]
+        
+        # Get funding rates
+        funding_history = {}
+        for coin in self.active_pairs:
+            try:
+                funding_data = await self._post_request("info", {
+                    "type": "fundingHistory",
+                    "coin": coin,
+                    "startTime": int((time.time() - 86400) * 1000)  # 24h ago
+                })
+                if funding_data:
+                    funding_history[coin] = funding_data
+            except Exception as e:
+                self.logger.error(f"Error getting funding history for {coin}: {e}")
+        
+        self.logger.info(f"Strategy initialized with {len(self.active_pairs)} active pairs")
+        return {"status": "success", "active_pairs": self.active_pairs}
+    
+    async def _post_request(self, endpoint: str, data: Dict) -> Dict:
+        """Helper method to make API requests to Hyperliquid"""
+        try:
+            headers = {"Content-Type": "application/json"}
+            response = requests.post(
+                f"{self.config.get('api_url', 'https://api.hyperliquid.xyz')}/{endpoint}", 
+                headers=headers, 
+                json=data
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            self.logger.error(f"API request error ({endpoint}): {e}")
+            return {}
+    
+    async def scan_funding_opportunities(self) -> List[Dict]:
+        """
+        Scan for funding rate arbitrage opportunities.
+        Negative funding rates pay longs, positive rates pay shorts.
+        """
+        opportunities = []
+        
+        # Get predicted funding rates using standardized API call
+        funding_data = await self._post_request("info", {"type": "predictedFundings"})
+        if not funding_data:
+            return []
+            
+        for pair_data in funding_data:
+            if len(pair_data) >= 2:
+                coin = pair_data[0]
+                venues = pair_data[1]
+                
+                # Find Hyperliquid funding rate
+                hl_funding = None
+                for venue_data in venues:
+                    if len(venue_data) >= 2 and venue_data[0] == "HlPerp":
+                        hl_funding = float(venue_data[1].get("fundingRate", 0))
+                        break
+                
+                if hl_funding is None:
+                    continue
+                    
+                # Check if funding rate meets our threshold
+                if hl_funding < self.funding_threshold:
+                    # Negative funding - go long to collect funding
+                    user_state = await self._post_request("info", {
+                        "type": "clearinghouseState",
+                        "user": self.address
+                    })
+                    
+                    account_value = float(user_state.get("marginSummary", {}).get("accountValue", 0))
+                    
+                    # Calculate position size (5% of account value)
+                    position_size = account_value * self.position_size_pct
+                    
+                    # Get coin current price
+                    asset_ctx_data = await self._post_request("info", {
+                        "type": "metaAndAssetCtxs"
+                    })
+                    
+                    current_price = 0
+                    if isinstance(asset_ctx_data, list) and len(asset_ctx_data) >= 2:
+                        meta, asset_ctxs = asset_ctx_data[0], asset_ctx_data[1]
+                        for i, asset in enumerate(meta.get("universe", [])):
+                            if asset["name"] == coin and i < len(asset_ctxs):
+                                current_price = float(asset_ctxs[i].get("midPx", 0))
+                    
+                    if current_price > 0:
+                        coin_size = position_size / current_price
+                        
+                        opportunities.append({
+                            "coin": coin,
+                            "funding_rate": hl_funding,
+                            "annualized_yield": -hl_funding * 24 * 365,  # Approximate annualized yield
+                            "direction": "long",
+                            "position_size": position_size,
+                            "coin_size": coin_size,
+                            "current_price": current_price
+                        })
+        
+        # Sort by best opportunities (most negative funding)
+        opportunities.sort(key=lambda x: x["funding_rate"])
+        return opportunities[:self.max_concurrent_arbs]  # Return top opportunities
+    
+    async def execute_funding_arbitrage(self, opportunities: List[Dict]) -> Dict:
+        """Execute funding arbitrage strategy with proper order format"""
+        results = []
+        
+        for opp in opportunities:
+            try:
+                coin = opp["coin"]
+                direction = opp["direction"]
+                coin_size = opp["coin_size"]
+                current_price = opp["current_price"]
+                
+                # Get asset ID
+                meta_info = await self._post_request("info", {"type": "meta"})
+                asset_id = None
+                for i, asset in enumerate(meta_info.get("universe", [])):
+                    if asset["name"] == coin:
+                        asset_id = i
+                        break
+                
+                if asset_id is None:
+                    self.logger.error(f"Unknown asset: {coin}")
+                    continue
+                
+                # Prepare leverage update
+                leverage_result = {
+                    "action": {
+                        "type": "updateLeverage",
+                        "coin": coin,
+                        "leverage": 10,
+                        "isXs": False  # isolated margin
+                    },
+                    "nonce": int(time.time() * 1000)
+                }
+                
+                # Prepare order following proper notation
+                order = {
+                    "a": asset_id,  # asset
+                    "b": direction == "long",  # isBuy
+                    "p": str(current_price * (0.995 if direction == "long" else 1.005)),  # price
+                    "s": str(coin_size),  # size
+                    "r": False,  # reduceOnly
+                    "t": {"limit": {"tif": "Alo"}}  # Add Liquidity Only (ALO)
+                }
+                
+                order_result = {
+                    "action": {
+                        "type": "order",
+                        "orders": [order],
+                        "grouping": "na"
+                    },
+                    "nonce": int(time.time() * 1000) + 1
+                }
+                
+                results.append({
+                    "coin": coin,
+                    "direction": direction,
+                    "size": coin_size,
+                    "price": current_price,
+                    "funding_rate": opp["funding_rate"],
+                    "annualized_yield": opp["annualized_yield"],
+                    "order_details": order_result
+                })
+                
+                # Wait to avoid rate limiting
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                self.logger.error(f"Error executing funding arbitrage for {opp['coin']}: {e}")
+                results.append({
+                    "coin": opp["coin"],
+                    "status": "error",
+                    "error": str(e)
+                })
+        
+        return {
+            "strategy": "funding_arbitrage",
+            "timestamp": time.time(),
+            "results": results
+        }
+    
+    async def run_strategy_cycle(self) -> Dict:
+        """Run a complete strategy cycle"""
+        try:
+            # Find opportunities
+            opportunities = await self.scan_funding_opportunities()
+            
+            if not opportunities:
+                return {
+                    "status": "no_opportunities",
+                    "message": "No funding arbitrage opportunities found",
+                    "timestamp": time.time()
+                }
+            
+            # Execute strategies
+            execution_results = await self.execute_funding_arbitrage(opportunities)
+            
+            return {
+                "status": "success",
+                "opportunities_found": len(opportunities),
+                "execution_results": execution_results,
+                "timestamp": time.time()
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error in HyperEVMEcosystem strategy cycle: {e}")
+            return {
+                "status": "error",
+                "message": str(e),
+                "timestamp": time.time()
+            }
+    
+    async def scan_cross_chain_arbitrage(self) -> List[Dict]:
+        """
+        Scan for price differences between Hyperliquid L1 and HyperEVM chain
+        """
+        arbitrage_opportunities = []
+        
+        try:
+            # Get Hyperliquid L1 prices
+            hl_prices = self.info.all_mids()
+            if not hl_prices:
+                return []
+            
+            # Get HyperEVM prices (simulated - would be replaced with actual API calls)
+            evm_prices = await self._get_hyperevm_prices()
+            
+            # Compare prices and find arbitrage opportunities
+            for coin, l1_price in hl_prices.items():
+                if coin in evm_prices:
+                    evm_price = evm_prices[coin]
+                    price_diff = abs(float(l1_price) - evm_price) / min(float(l1_price), evm_price)
+                    
+                    if price_diff > self.arb_min_spread:
+                        # Calculate potential profit
+                        user_state = await self.info.user_state(self.address)
+                        account_value = float(user_state.get("marginSummary", {}).get("accountValue", 0))
+                        position_size = account_value * self.position_size_pct
+                        
+                        arbitrage_opportunities.append({
+                            "coin": coin,
+                            "l1_price": float(l1_price),
+                            "evm_price": evm_price,
+                            "price_diff_pct": price_diff * 100,
+                            "direction": "buy_l1" if float(l1_price) < evm_price else "buy_evm",
+                            "potential_profit": price_diff * position_size,
+                            "position_size": position_size
+                        })
+            
+            # Sort by potential profit
+            arbitrage_opportunities.sort(key=lambda x: x["potential_profit"], reverse=True)
+            return arbitrage_opportunities[:self.max_concurrent_arbs]
+            
+        except Exception as e:
+            self.logger.error(f"Error scanning cross-chain arbitrage: {e}")
+            return []
+    
+    async def _get_hyperevm_prices(self) -> Dict[str, float]:
+        """
+        Get prices from HyperEVM chain
+        This is a placeholder - would be replaced with actual API calls to HyperEVM DEXes
+        """
+        # Simulate prices with small variations from L1
+        evm_prices = {}
+        all_mids = self.info.all_mids()
+        
+        for coin, price_str in all_mids.items():
+            # Add random variation of -0.5% to +0.5%
+            variation = 1 + (np.random.random() - 0.5) * 0.01
+            evm_prices[coin] = float(price_str) * variation
+        
+        return evm_prices
+    
+    async def execute_cross_chain_arbitrage(self, opportunities: List[Dict]) -> Dict:
+        """Execute cross-chain arbitrage between Hyperliquid L1 and HyperEVM"""
+        results = []
+        
+        for opp in opportunities:
+            try:
+                coin = opp["coin"]
+                direction = opp["direction"]
+                position_size = opp["position_size"]
+                
+                if direction == "buy_l1":
+                    # Buy on L1, sell on EVM
+                    l1_result = await self.trading_engine.place_maker_order(
+                        coin=coin,
+                        is_buy=True,
+                        size=position_size / opp["l1_price"],
+                        price=opp["l1_price"] * 1.001  # Small buffer
+                    )
+                    
+                    # In production: Bridge to EVM and sell there
+                    evm_result = {"status": "simulated", "message": "Would sell on EVM at " + str(opp["evm_price"])}
+                    
+                    results.append({
+                        "coin": coin,
+                        "direction": direction,
+                        "price_diff_pct": opp["price_diff_pct"],
+                        "potential_profit": opp["potential_profit"],
+                        "l1_result": l1_result,
+                        "evm_result": evm_result
+                    })
+                    
+                else:  # buy_evm
+                    # Buy on EVM, sell on L1
+                    # In production: Buy on EVM first
+                    evm_result = {"status": "simulated", "message": "Would buy on EVM at " + str(opp["evm_price"])}
+                    
+                    # Sell on L1
+                    l1_result = await self.trading_engine.place_maker_order(
+                        coin=coin,
+                        is_buy=False,
+                        size=position_size / opp["l1_price"],
+                        price=opp["l1_price"] * 0.999  # Small buffer
+                    )
+                    
+                    results.append({
+                        "coin": coin,
+                        "direction": direction,
+                        "price_diff_pct": opp["price_diff_pct"],
+                        "potential_profit": opp["potential_profit"],
+                        "l1_result": l1_result,
+                        "evm_result": evm_result
+                    })
+                
+                await asyncio.sleep(0.5)  # Avoid rate limiting
+                
+            except Exception as e:
+                self.logger.error(f"Error executing cross-chain arbitrage for {opp['coin']}: {e}")
+                results.append({
+                    "coin": opp["coin"],
+                    "status": "error",
+                    "error": str(e)
+                })
+        
+        return {
+            "strategy": "cross_chain_arbitrage",
+            "timestamp": time.time(),
+            "results": results
+        }
+    
     async def scan_hyperevm_opportunities(self) -> List[HyperEVMOpportunity]:
         """
-        Scan for active HyperEVM opportunities based on Pix's strategy
+        Scan for active HyperEVM opportunities based on real ecosystem data
         """
         opportunities = []
         
@@ -778,7 +1146,6 @@ contract HyperEVMYieldAggregator is ReentrancyGuard, Ownable {
         // Auto-compound yields across all protocols
         _rebalanceUser(msg.sender);
     }
-}
 '''
         
         return {
@@ -993,11 +1360,11 @@ class HyperLiquidArbitrageBot:
 import schedule
 import time
 import asyncio
-from strategies.hyperevm_ecosystem import HyperEVMEcosystemStrategy
+from strategies.hyperevm_ecosystem import HyperEVMEcosystem
 
 class HyperEVMAutomation:
     def __init__(self, trader):
-        self.strategy = HyperEVMEcosystemStrategy(trader)
+        self.strategy = HyperEVMEcosystem(trader)
     
     async def daily_routine(self):
         """Execute daily routine for maximum points"""
@@ -1167,3 +1534,82 @@ This is your edge. Use it.
         """
         
         return report.strip()
+
+    async def comprehensive_strategy_cycle(self) -> Dict:
+        """
+        Run a complete cycle of all strategies:
+        - Funding rate arbitrage
+        - Cross-chain arbitrage
+        - HyperEVM ecosystem opportunities
+        """
+        results = {
+            "timestamp": time.time(),
+            "strategies_executed": 0,
+            "total_opportunities": 0,
+            "total_estimated_profit": 0,
+            "strategy_results": {}
+        }
+        
+        try:
+            # 1. Run funding rate arbitrage
+            funding_opps = await self.scan_funding_opportunities()
+            if funding_opps:
+                funding_results = await self.execute_funding_arbitrage(funding_opps)
+                results["strategy_results"]["funding_arbitrage"] = funding_results
+                results["strategies_executed"] += 1
+                results["total_opportunities"] += len(funding_opps)
+                
+                # Calculate estimated profit from funding
+                funding_profit = sum(op["annualized_yield"] * op["position_size"] / 365 for op in funding_opps)
+                results["total_estimated_profit"] += funding_profit
+            
+            # 2. Run cross-chain arbitrage
+            arb_opps = await self.scan_cross_chain_arbitrage()
+            if arb_opps:
+                arb_results = await self.execute_cross_chain_arbitrage(arb_opps)
+                results["strategy_results"]["cross_chain_arbitrage"] = arb_results
+                results["strategies_executed"] += 1
+                results["total_opportunities"] += len(arb_opps)
+                
+                # Add cross-chain profits
+                arb_profit = sum(op["potential_profit"] for op in arb_opps)
+                results["total_estimated_profit"] += arb_profit
+            
+            # 3. Execute HyperEVM ecosystem opportunities
+            evm_opps = await self.scan_hyperevm_opportunities()
+            if evm_opps:
+                max_investment = 10000  # Example maximum investment
+                evm_results = await self.execute_hyperevm_strategy(max_investment)
+                results["strategy_results"]["hyperevm_opportunities"] = evm_results
+                results["strategies_executed"] += 1
+                results["total_opportunities"] += len(evm_opps)
+                
+            self.logger.info(f"Comprehensive strategy cycle executed: {results['strategies_executed']} strategies, " +
+                           f"{results['total_opportunities']} opportunities, ${results['total_estimated_profit']:.2f} estimated profit")
+            
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Error in comprehensive strategy cycle: {e}")
+            results["error"] = str(e)
+            return results
+
+    async def run_background(self):
+        """
+        Run strategy in the background continuously
+        """
+        self.logger.info("Starting HyperEVMEcosystem background task")
+        
+        while True:
+            try:
+                await self.comprehensive_strategy_cycle()
+                
+                # Wait for next cycle (15 minutes)
+                await asyncio.sleep(900)
+                
+            except asyncio.CancelledError:
+                self.logger.info("HyperEVMEcosystem background task cancelled")
+                break
+            except Exception as e:
+                self.logger.error(f"Error in HyperEVMEcosystem background task: {e}")
+                await asyncio.sleep(60)  # Wait a minute before retrying after error

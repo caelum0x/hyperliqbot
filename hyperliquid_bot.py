@@ -22,12 +22,17 @@ import example_utils
 from telegram_bot.config import config
 from database import bot_db
 
-# Setup logging
+# Configure logging
 logging.basicConfig(
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    handlers=[
+        logging.FileHandler('hyperliquid_bot.log'),
+        logging.StreamHandler()
+    ]
 )
-logger = logging.getLogger(__name__)
+
+logger = logging.getLogger('hyperliquid_bot')
 
 class RealHyperliquidBot:
     """Real implementation using Hyperliquid SDK with vault trading capabilities"""

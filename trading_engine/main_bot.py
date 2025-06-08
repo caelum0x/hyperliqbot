@@ -3,27 +3,35 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional
 import json
+
+# Add parent directory to path for imports
+# sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# This might be better if main_bot.py is in trading_engine, and telegram_bot is a sibling
+project_root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # Moves to hyperliqbot/
+if project_root_path not in sys.path:
+    sys.path.insert(0, project_root_path)
+
 
 from strategies.hyperevm_network import HyperEVMConnector, HyperEVMMonitor
 from strategies.seedify_imc import SeedifyIMCManager
-
-# Add parent directory to path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from trading_engine.base_trader import ProfitOptimizedTrader
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# Import Hyperliquid SDK components
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
-import example_utils
+from eth_account import Account
 
-# Import our components - fix the imports to use the actual file structure
-from trading_engine.core_engine import ProfitOptimizedTrader, TradingConfig
-from trading_engine.example_utils import setup
+from trading_engine.config import TradingConfig
+
+# Import the new TelegramAuthHandler
+from telegram_bot.telegram_auth_handler import TelegramAuthHandler
+
 
 # Configure logging
 logging.basicConfig(
@@ -39,7 +47,7 @@ class TelegramTradingBot:
     
     def __init__(self, token: str, config: Dict, vault_manager=None, trading_engine=None, database=None, user_manager=None):
         self.token = token
-        self.config = config
+        self.main_config = config # Store the main application config
         self.logger = logging.getLogger(__name__)
         
         # Dependency injection from main.py - Core Components
@@ -48,20 +56,32 @@ class TelegramTradingBot:
         self.database = database
         self.user_manager = user_manager
         
-        # Initialize user sessions with real Hyperliquid connections
-        self.user_sessions = {}  # user_id -> session with exchange, info, etc
+        self.user_sessions: Dict[int, Dict[str, Any]] = {} # Centralized user sessions
         self.active_strategies = {}
         self.profit_tracking = {}
         
-        # Components injected by main.py after initialization
-        self.profit_bot = None
-        self.strategies = {}
-        self.websocket_manager = None
+        # Components injected by main.py after initialization (if any)
+        self.profit_bot = None # Example, if used
+        self.strategies = {} # Example, if used
+        self.websocket_manager = None # Example, if used
         
-        self.referral_code = config.get("referral_code", "HYPERBOT")
+        self.referral_code = self.main_config.get("referral_code", "HYPERBOT")
         
-        # Initialize trading configuration
+        # Initialize trading configuration (bot's internal trading params)
         self.trading_config = TradingConfig()
+
+        # Initialize TelegramAuthHandler
+        # Get bot_username and api_url from the main config if available
+        bot_username = self.main_config.get("telegram", {}).get("bot_username", "YourBotUsername") # Ensure your main config has this
+        hyperliquid_api_url = self.main_config.get("hyperliquid", {}).get("api_url", constants.MAINNET_API_URL)
+        self.auth_handler = TelegramAuthHandler(
+            user_sessions=self.user_sessions, 
+            base_url=hyperliquid_api_url,
+            bot_username=bot_username
+        )
+        
+        # Initialize Telegram Application
+        self.app = Application.builder().token(self.token).build()
         self.setup_handlers()
 
     def setup_handlers(self):
@@ -69,7 +89,10 @@ class TelegramTradingBot:
         # Main commands
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("help", self.help_command))
-        self.app.add_handler(CommandHandler("connect", self.connect_wallet))
+        # Delegate /connect to TelegramAuthHandler
+        self.app.add_handler(CommandHandler("connect", self.auth_handler.handle_connect_command))
+        
+        self.app.add_handler(CommandHandler("status", self.status_command)) # New status command
         self.app.add_handler(CommandHandler("portfolio", self.show_portfolio))
         self.app.add_handler(CommandHandler("trade", self.trade_menu))
         self.app.add_handler(CommandHandler("strategies", self.strategies_menu))
@@ -79,7 +102,7 @@ class TelegramTradingBot:
         
         # Add missing command handlers
         self.app.add_handler(CommandHandler("deposit", self.handle_deposit_vault))
-        self.app.add_handler(CommandHandler("stats", self.handle_vault_stats))
+        self.app.add_handler(CommandHandler("stats", self.handle_vault_stats)) # Renamed from vault_info_command
         self.app.add_handler(CommandHandler("withdraw", self.handle_withdrawal_request))
         
         # New integrated handlers
@@ -92,7 +115,13 @@ class TelegramTradingBot:
         
         # Message handlers
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_messages))
-    
+
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Shows the current connection status for the user."""
+        user_id = update.effective_user.id
+        status_text = self.auth_handler.get_session_info_text(user_id)
+        await update.message.reply_text(status_text, parse_mode='Markdown')
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command with vault focus"""
         user_id = update.effective_user.id
@@ -150,92 +179,29 @@ Ready to join the alpha?"""
             context.user_data["referrer_id"] = referrer_id
     
     async def connect_wallet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle wallet connection with REAL Hyperliquid integration"""
-        user_id = update.effective_user.id
-        
-        if len(context.args) == 0:
-            await update.message.reply_text(
-                "🔐 **Connect Your Wallet**\n\n"
-                "To connect your wallet, send your private key:\n"
-                "`/connect YOUR_PRIVATE_KEY`\n\n"
-                "⚠️ **Security Note:** Your key is encrypted and stored securely. "
-                "Delete the message after sending for extra security.",
-                parse_mode='Markdown'
-            )
-            return
-        
-        try:
-            private_key = context.args[0]
-            
-            # Use REAL Hyperliquid SDK to connect
-            base_url = self.config.get("base_url", constants.TESTNET_API_URL)
-            address, info, exchange = example_utils.setup(base_url, skip_ws=True)
-            
-            # Override with user's private key
-            from eth_account import Account
-            account = Account.from_key(private_key)
-            exchange.wallet = account
-            
-            # Test connection with real API call
-            user_state = info.user_state(account.address)
-            account_value = float(user_state.get('marginSummary', {}).get('accountValue', 0))
-            
-            # Create integrated trading components
-            trader = ProfitOptimizedTrader(exchange, info, self.trading_config)
-            seedify_manager = SeedifyIMCManager(exchange, info, self.config)
-            
-            # Store comprehensive user session
-            self.user_sessions[user_id] = {
-                'exchange': exchange,
-                'info': info,
-                'address': account.address,
-                'account': account,
-                'balance': account_value,
-                'connected_at': datetime.now(),
-                'trader': trader,
-                'seedify_manager': seedify_manager,
-                'private_key': private_key  # Encrypt in production
-            }
-            
-            logger.info(f"Connected user {user_id}: {account.address}")
-            
-            await update.message.reply_text(
-                f"✅ **Wallet Connected Successfully!**\n\n"
-                f"📍 Address: `{account.address[:8]}...{account.address[-6:]}`\n"
-                f"💰 Account Value: ${account_value:,.2f}\n\n"
-                f"🤖 All trading features now available!\n"
-                f"🎯 Use /portfolio to see your positions.",
-                parse_mode='Markdown'
-            )
-            
-            # Auto-delete the message with private key for security
-            try:
-                await context.bot.delete_message(
-                    chat_id=update.effective_chat.id,
-                    message_id=update.message.message_id
-                )
-            except:
-                pass
-                
-        except Exception as e:
-            logger.error(f"Connection error: {e}")
-            await update.message.reply_text(f"❌ **Connection Failed**\n\nError: {str(e)}")
+        """
+        DEPRECATED: This method is now handled by TelegramAuthHandler.
+        The CommandHandler for /connect directly calls auth_handler.handle_connect_command.
+        This method can be removed or kept as a placeholder if other logic relied on it.
+        """
+        await self.auth_handler.handle_connect_command(update, context)
 
     async def show_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show user portfolio using REAL Hyperliquid data and injected components"""
         user_id = update.effective_user.id
         
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("❌ Please connect your wallet first using /connect")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.message.reply_text(error_message)
             return
         
         try:
-            session = self.user_sessions[user_id]
+            session = self.user_sessions[user_id] # Session is managed by AuthHandler
             info = session["info"]
-            address = session["address"]
+            # Address in session is always the main address, even if agent is used
+            main_address = session["address"] 
             
-            # Get REAL user state from Hyperliquid
-            user_state = info.user_state(address)
+            user_state = info.user_state(main_address)
             margin_summary = user_state.get("marginSummary", {})
             positions = user_state.get("assetPositions", [])
             
@@ -299,8 +265,13 @@ Ready to join the alpha?"""
         """Show trading menu using injected trading_engine"""
         user_id = update.effective_user.id
         
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("❌ Please connect your wallet first using /connect")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            # Check if query or message to reply appropriately
+            if update.callback_query:
+                await update.callback_query.edit_message_text(error_message)
+            else:
+                await update.message.reply_text(error_message)
             return
         
         if not self.trading_engine:
@@ -336,8 +307,12 @@ Ready to join the alpha?"""
         """Show automated strategies menu using injected strategies"""
         user_id = update.effective_user.id
         
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("❌ Please connect your wallet first using /connect")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            if update.callback_query:
+                await update.callback_query.edit_message_text(error_message)
+            else:
+                await update.message.reply_text(error_message)
             return
         
         keyboard = [
@@ -414,16 +389,34 @@ Ready to join the alpha?"""
         """Show profit tracking using REAL data"""
         user_id = update.effective_user.id
         
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("❌ Please connect your wallet first using /connect")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.message.reply_text(error_message)
             return
         
         try:
             session = self.user_sessions[user_id]
+            # Ensure trader is instantiated in the session by auth_handler or here
+            if 'trader' not in session:
+                 # Attempt to instantiate trader if not present; ensure ProfitOptimizedTrader is importable
+                 # This might be better handled within TelegramAuthHandler when session is created/updated
+                try:
+                    from trading_engine.base_trader import ProfitOptimizedTrader
+                    session['trader'] = ProfitOptimizedTrader(
+                        address=session['address'], 
+                        info=session['info'], 
+                        exchange=session['exchange']
+                    )
+                except ImportError:
+                    logger.error("ProfitOptimizedTrader could not be imported for show_profits.")
+                    await update.message.reply_text("❌ Profit tracking module is currently unavailable.")
+                    return
+
             trader = session["trader"]
             
             # Get REAL performance data
-            performance = await trader.track_performance()
+            # Assuming trader.track_performance() is an async method
+            performance = await trader.track_performance() 
             
             profit_text = f"💰 **Profit Analytics**\n\n"
             profit_text += f"📊 Account Value: ${performance.get('account_value', 0):,.2f}\n"
@@ -467,8 +460,9 @@ Ready to join the alpha?"""
         """Execute AI-powered trading strategy"""
         user_id = update.effective_user.id
         
-        if user_id not in self.user_sessions:
-            await update.message.reply_text("❌ Please connect your wallet first using /connect")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.message.reply_text(error_message)
             return
         
         try:
@@ -561,19 +555,28 @@ Ready to join the alpha?"""
         except Exception as e:
             await update.message.reply_text(f"❌ Error checking bridge status: {str(e)}")
     
-    async def handle_volume_farming(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def handle_volume_farming(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Handle volume farming strategy"""
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+        # Validate session using user_id from argument
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message)
             return
         
         try:
-            session = self.user_sessions[user_id]
-            api_session = session["api_session"]
-            seedify_manager = api_session["seedify_manager"]
+            session = self.user_sessions[user_id] # Use validated session
+            
+            # Instantiate SeedifyIMCManager with user's session components
+            # and the bot's main config
+            seedify_manager = SeedifyIMCManager(
+                hyperliquid_exchange=session['exchange'],
+                hyperliquid_info=session['info'],
+                config=self.main_config, # Bot's main config
+                address=session['address'] # User's address from session
+            )
             
             # Get user account value
-            user_state = api_session["info"].user_state(api_session["address"])
+            user_state = session["info"].user_state(session["address"])
             account_value = float(user_state.get("marginSummary", {}).get("accountValue", 0))
             
             strategy_result = await seedify_manager.create_volume_farming_strategy(account_value)
@@ -616,20 +619,47 @@ Ready to join the alpha?"""
         query = update.callback_query
         await query.answer()
         
-        user_id = query.from_user.id
+        user_id = query.from_user.id # User who pressed the button
         data = query.data
         
         try:
-            if data == "refresh_portfolio":
+            # Route to TelegramAuthHandler for agent creation
+            if data == "create_agent": # Matches callback_data from TelegramAuthHandler
+                await self.auth_handler.create_agent_wallet_for_user(update, context)
+                # Clean up temp data if any was stored by old connect_wallet, though new one doesn't use context.user_data for this
+                for key_suffix in ["account", "address", "info", "exchange"]:
+                    context.user_data.pop(f"temp_{key_suffix}_{user_id}", None)
+                return # Callback handled
+
+            # Deprecated callbacks from old connect_wallet, should be removed if handle_connect_command is fully adopted
+            elif data.startswith("create_agent_"): # Old format, if still somehow triggered
+                logger.warning(f"Deprecated callback 'create_agent_{user_id}' received. Should use 'create_agent'.")
+                # Fallback or error, ideally this path is not taken.
+                # For safety, can route to new handler if user_id matches.
+                requesting_user_id = int(data.split("_")[-1])
+                if user_id == requesting_user_id:
+                    await self.auth_handler.create_agent_wallet_for_user(update, context)
+                else:
+                     await query.edit_message_text("❌ Error: This action is not for you.")
+                return
+            elif data.startswith("direct_key_"): # Old format
+                logger.warning(f"Deprecated callback 'direct_key_{user_id}' received. Direct connection is now default from /connect.")
+                # The new handle_connect_command already sets up direct session.
+                # This callback might be redundant or indicate an old message.
+                await query.edit_message_text("ℹ️ Direct connection is established via `/connect`. Use `/status` to check.")
+                # Clean up temp data
+                for key_suffix in ["account", "address", "info", "exchange"]:
+                    context.user_data.pop(f"temp_{key_suffix}_{user_id}", None)
+                return
+
+            elif data == "refresh_portfolio":
                 # Refresh portfolio by calling show_portfolio
+                # show_portfolio itself now calls validate_session
+                await self.show_portfolio(update, context) # Pass update (which has query)
+                
+            elif data == "view_portfolio": # From TelegramAuthHandler's example buttons
                 await self.show_portfolio(update, context)
-                
-            elif data == "open_trading":
-                await self.trade_menu(update, context)
-                
-            elif data == "auto_strategies":
-                await self.strategies_menu(update, context)
-                
+
             elif data == "market_making":
                 await self.start_market_making(update, context, user_id)
                 
@@ -675,10 +705,11 @@ Ready to join the alpha?"""
             logger.error(f"Callback error: {e}")
             await query.edit_message_text(f"❌ Error: {str(e)}")
 
-    async def quick_maker_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def quick_maker_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Quick maker order placement"""
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message)
             return
         
         keyboard = [
@@ -700,10 +731,11 @@ Ready to join the alpha?"""
             reply_markup=reply_markup
         )
 
-    async def show_rebate_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def show_rebate_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Show current rebate status"""
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message)
             return
         
         try:
@@ -857,10 +889,13 @@ Ready to join the alpha?"""
 
     async def execute_trade_order(self, update: Update, context: ContextTypes.DEFAULT_TYPE, order_params: Dict):
         """Execute trade order using injected trading_engine"""
-        user_id = update.effective_user.id
-        
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+        # user_id should be part of order_params or fetched from update if this is a direct command path
+        # If called from a callback, query.from_user.id is the source.
+        user_id = update.effective_user.id # Get user_id from the update object (message or query)
+
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message) # Assuming it's from a callback
             return
         
         if not self.trading_engine:
@@ -910,8 +945,13 @@ Ready to join the alpha?"""
 
     async def handle_quick_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle quick trade using injected trading_engine"""
-        user_id = update.effective_user.id
-        
+        # This is likely a callback, so user_id from query
+        user_id = update.callback_query.from_user.id if update.callback_query else update.effective_user.id
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message)
+            return
+
         if not self.trading_engine:
             await update.callback_query.edit_message_text("❌ Trading engine not available")
             return
@@ -942,10 +982,11 @@ Ready to join the alpha?"""
             logger.error(f"Quick trade error: {e}")
             await update.callback_query.edit_message_text(f"❌ Error loading quick trade: {str(e)}")
 
-    async def setup_grid_strategy(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def setup_grid_strategy(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Setup grid strategy using injected strategies"""
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message)
             return
         
         if not self.strategies or 'grid_trading' not in self.strategies:
@@ -986,10 +1027,11 @@ Ready to join the alpha?"""
             logger.error(f"Grid strategy setup error: {e}")
             await update.callback_query.edit_message_text(f"❌ Error setting up grid strategy: {str(e)}")
 
-    async def start_market_making(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def start_market_making(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Start market making strategy"""
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message)
             return
         
         try:
@@ -1024,10 +1066,11 @@ Ready to join the alpha?"""
             logger.error(f"Market making setup error: {e}")
             await update.callback_query.edit_message_text(f"❌ Error setting up market making: {str(e)}")
 
-    async def execute_market_making_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def execute_market_making_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Execute market making orders"""
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message)
             return
         
         if not self.trading_engine:
@@ -1066,13 +1109,14 @@ Ready to join the alpha?"""
             logger.error(f"Market making execution error: {e}")
             await update.callback_query.edit_message_text(f"❌ Error executing market making: {str(e)}")
 
-    async def setup_dca_strategy(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def setup_dca_strategy(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Setup DCA strategy"""
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message)
             return
         
-        if not self.strategies or 'automated_trading' not in self.strategies:
+        if not self.strategies or 'automated_trading' not in self.strategies: # Assuming DCA is part of auto_trading
             await update.callback_query.edit_message_text("❌ DCA strategy not available")
             return
         
@@ -1099,8 +1143,13 @@ Ready to join the alpha?"""
             logger.error(f"DCA setup error: {e}")
             await update.callback_query.edit_message_text(f"❌ Error setting up DCA: {str(e)}")
 
-    async def handle_bridge_evm(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def handle_bridge_evm(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Handle bridging to EVM"""
+        # This action might not require an active Hyperliquid session, but good to be consistent if it does
+        # is_valid, error_message = self.auth_handler.validate_session(user_id)
+        # if not is_valid:
+        # await update.callback_query.edit_message_text(error_message)
+        # return
         try:
             keyboard = [
                 [InlineKeyboardButton("🔄 Bridge USDC", callback_data="bridge_usdc")],
@@ -1122,8 +1171,9 @@ Ready to join the alpha?"""
         except Exception as e:
             await update.callback_query.edit_message_text(f"❌ Error: {str(e)}")
 
-    async def handle_hyperlend(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def handle_hyperlend(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Handle HyperLend operations"""
+        # Similar to bridge, may not need active HL session for info display
         try:
             keyboard = [
                 [InlineKeyboardButton("💰 Lend USDC", callback_data="lend_usdc")],
@@ -1145,8 +1195,9 @@ Ready to join the alpha?"""
         except Exception as e:
             await update.callback_query.edit_message_text(f"❌ Error: {str(e)}")
 
-    async def handle_join_imc(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def handle_join_imc(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Handle joining IMC pool"""
+        # Similar to bridge, may not need active HL session for info display
         try:
             keyboard = [
                 [InlineKeyboardButton("🎯 Join Tier 1 ($1K)", callback_data="imc_tier1")],
@@ -1172,10 +1223,11 @@ Ready to join the alpha?"""
         except Exception as e:
             await update.callback_query.edit_message_text(f"❌ Error: {str(e)}")
 
-    async def handle_quick_buy_btc(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def handle_quick_buy_btc(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Handle quick BTC buy"""
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message)
             return
         
         if not self.trading_engine:
@@ -1205,10 +1257,11 @@ Ready to join the alpha?"""
             logger.error(f"Quick BTC buy error: {e}")
             await update.callback_query.edit_message_text(f"❌ Error buying BTC: {str(e)}")
 
-    async def handle_quick_sell_btc(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def handle_quick_sell_btc(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Handle quick BTC sell"""
-        if user_id not in self.user_sessions:
-            await update.callback_query.edit_message_text("❌ Please connect your wallet first")
+        is_valid, error_message = self.auth_handler.validate_session(user_id)
+        if not is_valid:
+            await update.callback_query.edit_message_text(error_message)
             return
         
         if not self.trading_engine:
@@ -1240,6 +1293,10 @@ Ready to join the alpha?"""
 
     async def show_market_analysis(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show market analysis"""
+        # This is likely a callback, so user_id from query
+        user_id = update.callback_query.from_user.id if update.callback_query else update.effective_user.id
+        # Market analysis might be general, or user-specific if settings affect it.
+        # Assuming general for now, so no session validation needed unless it becomes personalized.
         try:
             if self.trading_engine:
                 market_data = await self.trading_engine.get_market_data()
@@ -1272,8 +1329,12 @@ Ready to join the alpha?"""
             logger.error(f"Market analysis error: {e}")
             await update.callback_query.edit_message_text(f"❌ Error loading analysis: {str(e)}")
 
-    async def show_trading_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    async def show_trading_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int): # user_id passed as arg
         """Show trading settings"""
+        # is_valid, error_message = self.auth_handler.validate_session(user_id) # If settings are per-user and require auth
+        # if not is_valid:
+            # await update.callback_query.edit_message_text(error_message)
+            # return
         try:
             keyboard = [
                 [InlineKeyboardButton("⚙️ Risk Management", callback_data="risk_settings")],
@@ -1301,9 +1362,12 @@ Ready to join the alpha?"""
 
     async def show_live_trading(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show live trading interface"""
-        user_id = update.effective_user.id
+        user_id = update.effective_user.id # From message
         
-        if user_id not in self.user_sessions:
+        # Check session status but don't block the informational part if not connected
+        is_connected, _ = self.auth_handler.validate_session(user_id) # Use a softer check
+        
+        if not is_connected: # Show generic info if not connected
             await update.message.reply_text(
                 "📈 **Live Trading**\n\n"
                 "To access live trading, you need to connect your wallet first.\n\n"
@@ -1425,3 +1489,32 @@ For support, contact @HyperLiquidSupport
             f"24h Volume (last 100 trades): ${stats['volume_24h']:,.2f}\n"
             f"Total Trades: {stats['trades_count']}"
         )
+
+    async def _get_account_value(self, info_client: Info, address: str) -> float:
+        """Helper to get account value. Now part of TelegramTradingBot."""
+        try:
+            user_state_data = info_client.user_state(address)
+            return float(user_state_data.get('marginSummary', {}).get('accountValue', 0))
+        except Exception as e:
+            self.logger.error(f"Failed to get account value for {address}: {e}")
+            return 0.0
+
+    # Ensure this method is present if called by other parts of the bot
+    async def run(self):
+        logger.info("Telegram bot polling started...")
+        # If self.app is Application instance
+        await self.app.initialize() # Initialize handlers, etc.
+        await self.app.start()
+        await self.app.updater.start_polling() # Start polling
+        # Keep it running, or integrate with main bot's loop
+        # For example, if main bot has its own loop:
+        # while not self.app.updater.is_idle: # Or similar check
+        #    await asyncio.sleep(1)
+
+    async def stop(self):
+        logger.info("Stopping Telegram bot...")
+        if self.app and self.app.updater:
+            await self.app.updater.stop()
+        if self.app:
+            await self.app.stop()
+            await self.app.shutdown()

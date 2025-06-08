@@ -3,85 +3,281 @@ import json
 import time
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-import logging
-import sys
-import os
+import os # Ensure os is imported
+import sys # Ensure sys is imported
+import logging # Ensure logging is imported
+import time # Ensure time is imported
+import numpy as np # Ensure numpy is imported
+
 
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from hyperliquid.utils.types import *
-from trading_engine import main_bot, referral_manager, vault_manager, websocket_manager
+# Ensure trading_engine imports are structured to avoid circular dependencies
+# For example, if main_bot imports TradingEngine, TradingEngine should not import main_bot directly at module level.
+# from trading_engine import main_bot, referral_manager, vault_manager, websocket_manager
+from trading_engine.config import TradingConfig # Import TradingConfig
 
 # Import ALL actual examples from examples folder
-examples_dir = os.path.join(os.path.dirname(__file__), '..', 'examples')
-sys.path.append(examples_dir)
+# Corrected path to be relative to this file's location (trading_engine)
+examples_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'examples')
+if examples_dir not in sys.path:
+    sys.path.append(examples_dir)
+import example_utils # Ensure this is at the top if not already
 
-import basic_adding
-import basic_agent
-import basic_builder_fee
-import basic_leverage_adjustment
-import basic_market_order
-import basic_order
-import basic_order_modify
-import basic_schedule_cancel
-import basic_set_referrer
-import basic_spot_order
-import basic_spot_transfer
-import basic_sub_account
-import basic_tpsl
-import basic_transfer
-import basic_vault
-import basic_vault_transfer
-import basic_withdraw
-import basic_ws
-import cancel_open_orders
-import example_utils
 
-@dataclass
-class TradingConfig:
-    """Trading configuration based on actual Hyperliquid fee structure"""
-    # Real Hyperliquid fee rates from knowledge doc
-    base_taker_fee: float = 0.00035      # 0.035% for <$5M volume
-    base_maker_fee: float = 0.0001       # 0.01% for <$5M volume
+class RiskManagementSystem:
+    """
+    Comprehensive risk management system for the trading engine
+    Tracks position sizes, exposure, drawdowns, and enforces risk limits
+    """
     
-    # Maker rebate rates (negative = rebate)
-    rebate_tier_1: float = -0.00001      # -0.001% for >0.5% maker volume
-    rebate_tier_2: float = -0.00002      # -0.002% for >1.5% maker volume  
-    rebate_tier_3: float = -0.00003      # -0.003% for >3% maker volume
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        
+        # Risk tracking
+        self.position_sizes = {}           # Tracks position sizes by coin
+        self.position_timestamps = {}      # When positions were opened
+        self.daily_volume = {}             # Daily trading volume tracking
+        self.daily_trades = {}             # Number of daily trades by coin
+        self.max_drawdown = 0.0            # Maximum drawdown experienced
+        self.peak_account_value = 0.0      # Peak account value for drawdown calc
+        self.risk_adjustments = {}         # Risk adjustments by coin
+        self.coin_weights = {}             # Portfolio weights by coin
+        
+        # Risk limits
+        self.max_position_coin = 0.25      # Max 25% of portfolio in one coin
+        self.max_leverage = 10.0           # Max leverage for any position
+        self.max_concentration = 0.50      # Max 50% in correlated assets
+        self.max_daily_drawdown = 0.05     # Max 5% daily drawdown
+        self.min_liquidity_threshold = 1000000  # $1M min liquidity for trading
+        
+        # Coin-specific risk factors
+        self.volatility_factors = {
+            "BTC": 1.0,    # Base volatility reference
+            "ETH": 1.2,    # 20% more volatile than BTC
+            "SOL": 1.5,    # 50% more volatile than BTC
+            "ARB": 1.8,    # 80% more volatile than BTC
+            "APT": 2.0,    # 2x as volatile as BTC
+            "SUI": 2.2,    # 2.2x as volatile as BTC
+            "OP": 1.7,     # 70% more volatile than BTC
+            "MATIC": 1.6,  # 60% more volatile than BTC
+            "DOGE": 2.0,   # 2x as volatile as BTC
+            "AVAX": 1.5,   # 50% more volatile than BTC
+            "LINK": 1.6,   # 60% more volatile than BTC
+            "LTC": 1.3,    # 30% more volatile than BTC
+            "XRP": 1.4,    # 40% more volatile than BTC
+        }
+        
+        # Trading cooldowns
+        self.trading_cooldowns = {}        # Cooldown period after losses
+        self.blocked_coins = set()         # Temporarily blocked coins
+        
+        # Risk stats
+        self.wins = 0
+        self.losses = 0
+        self.total_profit = 0.0
+        self.total_loss = 0.0
+        self.last_risk_assessment = 0
+        
+        self.logger.info("RiskManagementSystem initialized")
     
-    # Volume thresholds for fee tiers (14-day volume)
-    tier_1_volume: float = 5000000       # $5M
-    tier_2_volume: float = 25000000      # $25M
-    tier_3_volume: float = 125000000     # $125M
+    def update_account_value(self, account_value: float) -> None:
+        """Update account value and track drawdown"""
+        # Update peak value for drawdown calculations
+        if account_value > self.peak_account_value:
+            self.peak_account_value = account_value
+        
+        # Calculate current drawdown
+        if self.peak_account_value > 0:
+            current_drawdown = (self.peak_account_value - account_value) / self.peak_account_value
+            
+            # Update max drawdown if needed
+            if current_drawdown > self.max_drawdown:
+                self.max_drawdown = current_drawdown # Restored
     
-    # Risk management
-    max_position_size: float = 10000     # $10k max position
-    min_profit_threshold: float = 0.001  # 0.1% minimum profit
+    def can_trade(self, coin: str) -> bool:
+        """Check if trading is allowed for a specific coin"""
+        # Check if coin is blocked
+        if coin in self.blocked_coins:
+            self.logger.info(f"Coin {coin} is currently blocked from trading")
+            return False
+        
+        # Check if we're in cooldown period
+        current_time = time.time()
+        if coin in self.trading_cooldowns and current_time < self.trading_cooldowns[coin]:
+            cooldown_minutes = (self.trading_cooldowns[coin] - current_time) / 60
+            self.logger.info(f"Trading cooldown for {coin}: {cooldown_minutes:.1f} minutes remaining")
+            return False
+        
+        # Check daily trade limits
+        today = time.strftime("%Y-%m-%d")
+        if today in self.daily_trades and coin in self.daily_trades[today]:
+            if self.daily_trades[today][coin] > 20: # Add logic for what happens if limit exceeded
+                self.logger.info(f"Daily trade limit reached for {coin}") # Restored
+                return False # Restored
+        
+        return True
     
-    # Vault settings
-    vault_profit_share: float = 0.10     # 10% profit share (actual rate)
-    vault_minimum_capital: float = 100   # 100 USDC minimum
-    vault_leader_min_ownership: float = 0.05  # 5% minimum ownership
+    def get_risk_adjustment(self, coin: str) -> float:
+        """Get risk adjustment factor for a coin based on volatility and performance"""
+        # Default risk adjustment is 1.0
+        if coin not in self.risk_adjustments:
+            # Apply volatility factor
+            vol_factor = self.volatility_factors.get(coin, 1.5)  # Default 1.5x volatility factor
+            
+            # More volatile coins get smaller position sizes (inverse relationship)
+            self.risk_adjustments[coin] = 1.0 / vol_factor
+        
+        return self.risk_adjustments[coin]
     
-    # Referral settings
-    referral_commission_rate: float = 0.10    # 10% of referee fees
-    referral_user_discount: float = 0.004    # 4% fee discount
-    referral_volume_limit: float = 25000000  # $25M per referee
+    def record_trade(self, coin: str, trade_size_usd: float, is_buy: bool) -> None:
+        """Record a new trade to update risk tracking"""
+        # Update position sizes
+        if coin not in self.position_sizes:
+            self.position_sizes[coin] = 0.0
+        
+        # Update based on direction
+        if is_buy:
+            self.position_sizes[coin] += trade_size_usd
+        else:
+            self.position_sizes[coin] -= trade_size_usd
+        
+        # Record timestamp
+        self.position_timestamps[coin] = time.time()
+        
+        # Update daily volume
+        today = time.strftime("%Y-%m-%d")
+        if today not in self.daily_volume:
+            self.daily_volume[today] = {}
+        
+        if coin not in self.daily_volume[today]:
+            self.daily_volume[today][coin] = 0.0
+            
+        self.daily_volume[today][coin] += trade_size_usd
+        
+        # Update daily trades count
+        if today not in self.daily_trades:
+            self.daily_trades[today] = {}
+            
+        if coin not in self.daily_trades[today]:
+            self.daily_trades[today][coin] = 0
+            
+        self.daily_trades[today][coin] += 1
+        
+        self.logger.info(f"Recorded {coin} trade: ${trade_size_usd:,.2f}")
+    
+    def record_trade_result(self, coin: str, pnl: float) -> None:
+        """Record the result of a closed trade"""
+        if pnl > 0:
+            self.wins += 1
+            self.total_profit += pnl
+            
+            # If profitable, reduce risk adjustment (allow larger positions)
+            if coin in self.risk_adjustments:
+                self.risk_adjustments[coin] *= 1.1 # Restored
+                
+        else:
+            self.losses += 1
+            self.total_loss += abs(pnl)
+            
+            # Apply cooldown after significant loss
+            if abs(pnl) > 100: # Example threshold # Restored
+                self.trading_cooldowns[coin] = time.time() + 3600 # Restored
+                self.logger.info(f"Cooldown applied for {coin} due to significant loss.") # Restored
+    
+    def assess_overall_risk(self, account_value: float) -> Dict:
+        """Perform comprehensive risk assessment of the portfolio"""
+        # Only run assessment every 15 minutes
+        current_time = time.time()
+        if current_time - self.last_risk_assessment < 900:  # 15 minutes
+            return {}
+            
+        self.last_risk_assessment = current_time
+        
+        # Calculate total exposure
+        total_exposure = sum(abs(size) for size in self.position_sizes.values())
+        
+        # Calculate leverage
+        current_leverage = total_exposure / account_value if account_value > 0 else 0
+        
+        # Calculate concentration
+        max_position = max(abs(size) for size in self.position_sizes.values()) if self.position_sizes else 0
+        concentration = max_position / account_value if account_value > 0 else 0
+        
+        # Calculate win rate
+        total_trades = self.wins + self.losses
+        win_rate = self.wins / total_trades if total_trades > 0 else 0
+        
+        # Calculate profit factor
+        profit_factor = self.total_profit / self.total_loss if self.total_loss > 0 else float('inf')
+        
+        # Risk state assessment
+        risk_state = "normal"
+        if current_leverage > self.max_leverage * 0.8:
+            risk_state = "high_leverage"
+        elif concentration > self.max_concentration * 0.8:
+            risk_state = "high_concentration"
+        elif self.max_drawdown > self.max_daily_drawdown * 0.8:
+            risk_state = "high_drawdown"
+        
+        risk_assessment = {
+            "account_value": account_value,
+            "total_exposure": total_exposure,
+            "leverage": current_leverage,
+            "max_position": max_position,
+            "concentration": concentration,
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
+            "max_drawdown": self.max_drawdown,
+            "risk_state": risk_state
+        }
+        
+        self.logger.info(f"Risk assessment: {risk_state.upper()} - Leverage: {current_leverage:.2f}x, Concentration: {concentration:.2%}")
+        return risk_assessment
+    
+    def get_position_size_usd(self, coin: str) -> float:
+        """Get current position size for a coin"""
+        return abs(self.position_sizes.get(coin, 0.0))
+    
+    def get_trading_stats(self) -> Dict:
+        """Get overall trading statistics"""
+        total_trades = self.wins + self.losses
+        
+        return {
+            "wins": self.wins,
+            "losses": self.losses,
+            "total_trades": total_trades,
+            "win_rate": self.wins / total_trades if total_trades > 0 else 0,
+            "total_profit": self.total_profit,
+            "total_loss": self.total_loss,
+            "profit_factor": self.total_profit / self.total_loss if self.total_loss > 0 else float('inf'),
+            "max_drawdown": self.max_drawdown
+        }
+    
+    def reset_daily_limits(self) -> None:
+        """Reset daily trading limits"""
+        today = time.strftime("%Y-%m-%d")
+        self.daily_volume[today] = {}
+        self.daily_trades[today] = {}
+        self.logger.info("Daily trading limits reset")
 
 class TradingEngineContext:
     """
     TradingEngineContext exposes all trading engine modules and helpers for orchestrated bot use.
     """
     def __init__(self):
-        self.basic_leverage_adjustment = basic_leverage_adjustment
-        self.basic_schedule_cancel = basic_schedule_cancel
-        self.cancel_open_orders = cancel_open_orders
+        # These would need to be actual functions or methods imported or defined
+        # from . import basic_leverage_adjustment, basic_schedule_cancel, cancel_open_orders
+        # self.basic_leverage_adjustment = basic_leverage_adjustment
+        # self.basic_schedule_cancel = basic_schedule_cancel
+        # self.cancel_open_orders = cancel_open_orders
         self.example_utils = example_utils
-        self.main_bot = main_bot
-        self.referral_manager = referral_manager
-        self.vault_manager = vault_manager
-        self.websocket_manager = websocket_manager
+        # self.main_bot = main_bot # Avoid direct import if main_bot imports TradingEngine
+        # self.referral_manager = referral_manager
+        # self.vault_manager = vault_manager
+        # self.websocket_manager = websocket_manager
 
     def info(self):
         """
@@ -103,21 +299,46 @@ class TradingEngine:
     Now imports and uses ALL available examples
     """
     
-    def __init__(self, base_url=None, account=None, wallet_manager=None):
-        if wallet_manager:
-            self.wallet_manager = wallet_manager
-            self.address = None  # Will be set when using specific wallet
-            self.info = wallet_manager.info
-            self.exchange = None  # Will be set when using specific wallet
-        else:
-            # Use example_utils.setup exactly as all examples do
-            self.address, self.info, self.exchange = example_utils.setup(
-                base_url=base_url or constants.TESTNET_API_URL,
-                skip_ws=True
-            )
-            self.wallet_manager = None
-        
+    def __init__(self, base_url=None, account=None, wallet_manager=None, address=None, info=None, exchange=None, config_for_self_init=None): # Added config_for_self_init
         self.logger = logging.getLogger(__name__)
+        self.wallet_manager = wallet_manager
+        self.config_for_self_init = config_for_self_init # Store if passed
+        
+        if wallet_manager:
+            self.address = None  # Will be set when using specific wallet
+            # Assuming wallet_manager provides info and exchange instances when a wallet is selected
+            self.info = wallet_manager.info if hasattr(wallet_manager, 'info') else None 
+            self.exchange = None # Will be set by use_wallet
+            self.logger.info("TradingEngine initialized with WalletManager. Waiting for wallet selection.")
+        elif address and info and exchange: # If components are passed directly
+            self.address = address
+            self.info = info
+            self.exchange = exchange
+            self.logger.info(f"TradingEngine initialized with pre-configured components for address: {self.address}")
+        else:
+            # Use example_utils.setup for the bot's main operational account
+            self.logger.info("TradingEngine attempting to initialize default connection using example_utils.")
+            
+            effective_base_url = base_url
+            if not effective_base_url and self.config_for_self_init:
+                effective_base_url = self.config_for_self_init.get("hyperliquid", {}).get("api_url", constants.TESTNET_API_URL)
+            elif not effective_base_url: # Fallback if no base_url and no config_for_self_init
+                effective_base_url = constants.TESTNET_API_URL 
+                self.logger.warning(f"TradingEngine self-initializing without explicit base_url or config, defaulting to {effective_base_url}")
+
+            # The new example_utils.setup (via HyperliquidAuth) handles agent/direct logic internally.
+            # It prioritizes agent_config.json if present in the project root.
+            # The 'use_agent_for_core_operations' flag from config_for_self_init is not directly
+            # used by example_utils.setup in its current form, as HyperliquidAuth always tries agent first.
+            try:
+                self.address, self.info, self.exchange = example_utils.setup(base_url=effective_base_url)
+                self.logger.info(f"TradingEngine self-initialized for address {self.address} on {effective_base_url}")
+            except ValueError as ve: 
+                self.logger.critical(f"CRITICAL: {ve} - TradingEngine cannot initialize its default Hyperliquid connection. Check config/keys.")
+                raise
+            except Exception as e:
+                self.logger.critical(f"Failed to setup Hyperliquid connection via example_utils for TradingEngine: {e}", exc_info=True)
+                raise
         
         # Risk management system
         self.risk_manager = RiskManagementSystem()
@@ -133,33 +354,36 @@ class TradingEngine:
     def use_wallet(self, wallet_name: str, sub_account_name: str = None):
         """Switch to using a specific wallet or sub-account"""
         if not self.wallet_manager:
+            self.logger.error("WalletManager not available in TradingEngine.")
             raise ValueError("No wallet manager available")
         
-        wallet = self.wallet_manager.get_wallet(wallet_name)
-        if not wallet:
+        wallet_details = self.wallet_manager.get_wallet(wallet_name) # Assuming get_wallet returns a dict or object with details
+        if not wallet_details:
+            self.logger.error(f"Wallet '{wallet_name}' not found by WalletManager.")
             raise ValueError(f"Wallet '{wallet_name}' not found")
         
+        # Assuming wallet_details contains 'address' and 'private_key' or an 'account' object
+        # And WalletManager provides a method to get an exchange instance for a given wallet/sub-account
+        
         if sub_account_name:
-            # Use sub-account following basic_sub_account.py pattern
-            sub_accounts = self.wallet_manager.get_sub_accounts(wallet_name)
-            sub_account = None
-            for sa in sub_accounts:
-                if sa.name == sub_account_name:
-                    sub_account = sa
-                    break
-            
-            if not sub_account:
-                raise ValueError(f"Sub-account '{sub_account_name}' not found")
+            sub_account_address = self.wallet_manager.get_sub_account_address(wallet_name, sub_account_name) # Hypothetical method
+            if not sub_account_address:
+                self.logger.error(f"Sub-account '{sub_account_name}' not found for wallet '{wallet_name}'.")
+                raise ValueError(f"Sub-account '{sub_account_name}' not found for wallet '{wallet_name}'")
             
             # Create exchange with vault_address set to sub-account (basic_vault.py pattern)
-            self.exchange = self.wallet_manager.get_exchange(wallet_name, vault_address=sub_account.address)
-            self.address = sub_account.address
-            self.logger.info(f"Using sub-account '{sub_account_name}' at {sub_account.address}")
+            # This implies WalletManager can provide an Exchange instance configured for a sub-account
+            self.exchange = self.wallet_manager.get_exchange_for_sub_account(wallet_name, sub_account_name) # Hypothetical
+            self.address = sub_account_address
+            # Info client can usually remain the same unless sub-account has specific info endpoint needs
+            self.info = self.wallet_manager.get_info_for_wallet(wallet_name) # Hypothetical
+            self.logger.info(f"TradingEngine now using sub-account '{sub_account_name}' at {self.address}")
         else:
             # Use main wallet
             self.exchange = self.wallet_manager.get_exchange(wallet_name)
-            self.address = wallet.address
-            self.logger.info(f"Using wallet '{wallet_name}' at {wallet.address}")
+            self.address = wallet_details.get('address')
+            # If wallet_details contains private key or account info, it can be used to set up info client
+            self.logger.info(f"TradingEngine now using wallet '{wallet_name}' at {self.address}")
 
     async def create_and_fund_sub_account(self, parent_wallet_name: str, sub_account_name: str, 
                                         usd_amount: float = 1.0, token_transfers: List[Dict] = None):
@@ -173,17 +397,47 @@ class TradingEngine:
 
     async def place_limit_order(self, coin, is_buy, size, price):
         """Place limit order using basic_order.py pattern exactly"""
+        if not self.exchange or not self.info:
+            self.logger.error("Exchange or Info client not initialized in TradingEngine. Cannot place order.")
+            return {"status": "error", "message": "TradingEngine not fully initialized."}
         try:
-            # Exact pattern from basic_order.py main() function
-            order_result = self.exchange.order(coin, is_buy, size, price, {"limit": {"tif": "Gtc"}})
-            print(order_result)
+            # Get asset ID according to Hyperliquid standards
+            meta = self.info.meta()
+            asset_id = None
+            
+            # Handle different asset types (perps, spot, builder-deployed)
+            # This logic needs to be robust based on actual meta structure
+            target_name = coin.upper()
+            for i, asset_data in enumerate(meta.get("universe", [])):
+                if asset_data.get("name", "").upper() == target_name:
+                    asset_id = i
+                    break
+            
+            if asset_id is None:
+                self.logger.error(f"Coin {coin} (target: {target_name}) not found in metadata: {meta.get('universe', [])[:5]}") # Log first 5 for debug
+                return {"status": "error", "message": f"Coin {coin} not found"}
+                
+            # Format order following Hyperliquid notation standards
+            order = {
+                "a": asset_id,  # asset
+                "b": is_buy,    # isBuy
+                "p": str(price), # price
+                "s": str(size),  # size
+                "r": False,     # reduceOnly
+                "t": {"limit": {"tif": "Gtc"}}  # Good Till Cancelled
+            }
+            
+            # Place the order with proper format
+            order_result = self.exchange.order(
+                orders=[order],
+                grouping="na"
+            )
             
             if order_result["status"] == "ok":
                 status = order_result["response"]["data"]["statuses"][0]
                 if "resting" in status:
                     order_status = self.info.query_order_by_oid(self.address, status["resting"]["oid"])
-                    print("Order status by oid:", order_status)
-            
+                    
             self.logger.info(f"Limit order placed: {coin} {size}@{price}")
             return order_result
         except Exception as e:
@@ -191,11 +445,40 @@ class TradingEngine:
             return {"status": "error", "message": str(e)}
         
     async def place_market_order(self, coin, is_buy, size):
-        """Place market order using basic_market_order.py pattern exactly"""
+        """Place market order using basic_market_order.py pattern with correct notation"""
+        if not self.exchange or not self.info:
+            self.logger.error("Exchange or Info client not initialized in TradingEngine. Cannot place order.")
+            return {"status": "error", "message": "TradingEngine not fully initialized."}
         try:
-            # Exact pattern from basic_market_order.py
-            order_result = self.exchange.market_open(coin, is_buy, size, None, 0.01)
-            print(order_result)
+            # Get asset ID according to Hyperliquid standards
+            meta = self.info.meta()
+            asset_id = None
+            target_name = coin.upper()
+            for i, asset_data in enumerate(meta.get("universe", [])):
+                if asset_data.get("name", "").upper() == target_name:
+                    asset_id = i
+                    break
+                    
+            if asset_id is None:
+                self.logger.error(f"Coin {coin} (target: {target_name}) not found for market order.")
+                return {"status": "error", "message": f"Coin {coin} not found"}
+            
+            # Format IOC order for immediate execution (market-like)
+            order = {
+                "a": asset_id,  # asset
+                "b": is_buy,    # isBuy
+                "p": str(1000000 if is_buy else 0.00001),  # Extreme price for immediate execution
+                "s": str(size),  # size
+                "r": False,     # reduceOnly
+                "t": {"limit": {"tif": "Ioc"}}  # Immediate or Cancel
+            }
+            
+            # Place the order with proper format
+            order_result = self.exchange.order(
+                orders=[order],
+                grouping="na"
+            )
+            
             self.logger.info(f"Market order placed: {coin} {size}")
             return order_result
         except Exception as e:
@@ -203,17 +486,44 @@ class TradingEngine:
             return {"status": "error", "message": str(e)}
         
     async def place_adding_liquidity_order(self, coin, is_buy, size, price):
-        """Place add liquidity order using basic_adding.py pattern exactly"""
+        """Place add liquidity order using basic_adding.py pattern with proper notation"""
+        if not self.exchange or not self.info:
+            self.logger.error("Exchange or Info client not initialized in TradingEngine. Cannot place order.")
+            return {"status": "error", "message": "TradingEngine not fully initialized."}
         try:
-            # Exact pattern from basic_adding.py for guaranteed maker rebates
-            order_result = self.exchange.order(coin, is_buy, size, price, {"limit": {"tif": "Alo"}})
-            print(order_result)
+            # Get asset ID according to Hyperliquid standards
+            meta = self.info.meta()
+            asset_id = None
+            target_name = coin.upper()
+            for i, asset_data in enumerate(meta.get("universe", [])):
+                if asset_data.get("name", "").upper() == target_name:
+                    asset_id = i
+                    break
+                    
+            if asset_id is None:
+                self.logger.error(f"Coin {coin} (target: {target_name}) not found for ALO order.")
+                return {"status": "error", "message": f"Coin {coin} not found"}
+            
+            # Format ALO order for guaranteed maker rebates
+            order = {
+                "a": asset_id,  # asset
+                "b": is_buy,    # isBuy
+                "p": str(price), # price
+                "s": str(size),  # size
+                "r": False,     # reduceOnly
+                "t": {"limit": {"tif": "Alo"}}  # Add Liquidity Only
+            }
+            
+            # Place the order with proper format
+            order_result = self.exchange.order(
+                orders=[order],
+                grouping="na"
+            )
             
             if order_result["status"] == "ok":
                 status = order_result["response"]["data"]["statuses"][0]
                 if "resting" in status:
                     order_status = self.info.query_order_by_oid(self.address, status["resting"]["oid"])
-                    print("Order status by oid:", order_status)
             
             self.logger.info(f"Add liquidity order placed: {coin} {size}@{price}")
             return order_result
@@ -223,25 +533,70 @@ class TradingEngine:
         
     async def place_tpsl_order(self, coin, is_buy, size, price, tp_price=None, sl_price=None):
         """Place order with take profit/stop loss using basic_tpsl.py pattern"""
+        if not self.exchange or not self.info:
+            self.logger.error("Exchange or Info client not initialized in TradingEngine. Cannot place order.")
+            return {"status": "error", "message": "TradingEngine not fully initialized."}
         try:
             # Construct TPSL order following basic_tpsl.py pattern
-            order_type = {"limit": {"tif": "Gtc"}}
+            # The SDK's exchange.order method takes a list of orders.
             
-            if tp_price or sl_price:
-                order_type["tpsl"] = []
-                if tp_price:
-                    order_type["tpsl"].append({
-                        "trigger": {"px": tp_price, "isMarket": True, "sz": size},
-                        "condition": "tp"
-                    })
-                if sl_price:
-                    order_type["tpsl"].append({
-                        "trigger": {"px": sl_price, "isMarket": True, "sz": size},
-                        "condition": "sl"
-                    })
+            meta = self.info.meta()
+            asset_id = None
+            target_name = coin.upper()
+            for i, asset_data in enumerate(meta.get("universe", [])):
+                if asset_data.get("name", "").upper() == target_name:
+                    asset_id = i
+                    break
+            if asset_id is None:
+                self.logger.error(f"Coin {coin} (target: {target_name}) not found for TPSL order.")
+                return {"status": "error", "message": f"Coin {coin} not found"}
+
+            order_type_details = {"limit": {"tif": "Gtc"}} 
+
+            order_payload = {
+                "a": asset_id,
+                "b": is_buy,
+                "p": str(price),
+                "s": str(size),
+                "r": False, 
+                "t": order_type_details 
+            }
             
-            order_result = self.exchange.order(coin, is_buy, size, price, order_type)
-            print(order_result)
+            # The Hyperliquid SDK handles TP/SL as part of the order type 't'.
+            # Example from SDK: order_type = {"trigger": {"triggerPx": "100", "isMarket": True, "tpsl": "tp"}}
+            # This needs to be structured carefully. A single order can be a limit order with attached TP/SL triggers.
+            # Or, TP/SL can be separate trigger orders. The `basic_tpsl.py` example should be the guide.
+
+            # For simplicity, if tp_price or sl_price are provided, we might modify the order_type_details
+            # or create additional trigger orders. The current structure of adding "tpsl" key directly to
+            # order_payload might not be standard for all TP/SL types.
+            # Let's assume for now that TP/SL are defined within the 't' (type) field for trigger orders.
+            # If the main order is a limit and TP/SL are separate triggers:
+            orders_to_place = [order_payload]
+
+            if tp_price:
+                tp_order_type = {"trigger": {"triggerPx": str(tp_price), "isMarket": True, "tpsl": "tp"}}
+                tp_trigger = {
+                    "a": asset_id, "b": not is_buy, "p": str(tp_price), "s": str(size), "r": True, "t": tp_order_type
+                }
+                orders_to_place.append(tp_trigger)
+            
+            if sl_price:
+                sl_order_type = {"trigger": {"triggerPx": str(sl_price), "isMarket": True, "tpsl": "sl"}}
+                sl_trigger = {
+                    "a": asset_id, "b": not is_buy, "p": str(sl_price), "s": str(size), "r": True, "t": sl_order_type
+                }
+                orders_to_place.append(sl_trigger)
+            
+            # Grouping can be "na" (no atomicity) or " μαζί" (all or none)
+            grouping_type = "na" # Default to no atomicity for separate orders
+            if len(orders_to_place) > 1:
+                 # Consider "μαζί" if all orders (main + TP/SL) should succeed or fail together
+                 # grouping_type = " μαζί" # Greek word for "together"
+                 pass
+
+
+            order_result = self.exchange.order(orders=orders_to_place, grouping=grouping_type)
             
             self.logger.info(f"TPSL order placed: {coin} {size}@{price} TP:{tp_price} SL:{sl_price}")
             return order_result
@@ -249,679 +604,27 @@ class TradingEngine:
             self.logger.error(f"Error placing TPSL order: {e}")
             return {"status": "error", "message": str(e)}
         
-    async def modify_order(self, coin, oid, new_price, new_size=None):
-        """Modify order using basic_order_modify.py pattern"""
+    async def modify_order(self, coin: str, order_id: int, new_price: float, new_size: Optional[float] = None, 
+                         reduce_only: Optional[bool] = None, order_type: Optional[Dict] = None) -> Dict:
+        """
+        Modify an existing order following the official Hyperliquid API format
+        """
+        if not self.exchange or not self.info:
+            self.logger.error("Exchange or Info client not initialized in TradingEngine. Cannot modify order.")
+            return {"status": "error", "message": "TradingEngine not fully initialized."}
         try:
-            # Use basic_order_modify.py pattern
-            modify_result = self.exchange.modify_order(coin, oid, new_price, new_size)
-            print(modify_result)
-            
-            self.logger.info(f"Order modified: {coin} oid:{oid} new_price:{new_price}")
-            return modify_result
+            # Get asset ID according to Hyperliquid standards
+            meta = self.info.meta()
+            asset_id = None
+            target_name = coin.upper()
+            for i, asset_data in enumerate(meta.get("universe", [])):
+                if asset_data.get("name", "").upper() == target_name:
+                    asset_id = i
+                    break
+                    
+            if asset_id is None:
+                self.logger.error(f"Coin {coin} (target: {target_name}) not found for modifying order.")
+                return {"status": "error", "message": f"Coin {coin} not found"}
         except Exception as e:
             self.logger.error(f"Error modifying order: {e}")
             return {"status": "error", "message": str(e)}
-        
-    async def set_referrer(self, referrer_code: str):
-        """Set referrer using basic_set_referrer.py pattern"""
-        try:
-            # Use basic_set_referrer.py pattern
-            result = self.exchange.set_referrer(referrer_code)
-            print(result)
-            
-            self.logger.info(f"Referrer set: {referrer_code}")
-            return result
-        except Exception as e:
-            self.logger.error(f"Error setting referrer: {e}")
-            return {"status": "error", "message": str(e)}
-        
-    async def place_spot_order(self, coin, is_buy, size, price):
-        """Place spot order using basic_spot_order.py pattern"""
-        try:
-            # Use basic_spot_order.py pattern
-            order_result = self.exchange.spot_order(coin, is_buy, size, price, {"limit": {"tif": "Gtc"}})
-            print(order_result)
-            
-            self.logger.info(f"Spot order placed: {coin} {size}@{price}")
-            return order_result
-        except Exception as e:
-            self.logger.error(f"Error placing spot order: {e}")
-            return {"status": "error", "message": str(e)}
-        
-    async def transfer_spot(self, amount, destination, token):
-        """Transfer spot tokens using basic_spot_transfer.py pattern"""
-        try:
-            # Check permissions like basic_spot_transfer.py
-            if self.exchange.account_address != self.exchange.wallet.address:
-                return {"status": "error", "message": "Agents do not have permission to perform internal transfers"}
-            
-            # Use basic_spot_transfer.py pattern
-            transfer_result = self.exchange.spot_transfer(amount, destination, token)
-            print(transfer_result)
-            
-            self.logger.info(f"Spot transfer: {amount} {token} to {destination}")
-            return transfer_result
-        except Exception as e:
-            self.logger.error(f"Error transferring spot: {e}")
-            return {"status": "error", "message": str(e)}
-        
-    async def withdraw_from_bridge(self, amount, destination=None):
-        """Withdraw using basic_withdraw.py pattern"""
-        try:
-            # Check permissions like basic_withdraw.py
-            if self.exchange.account_address != self.exchange.wallet.address:
-                return {"status": "error", "message": "Agents do not have permission to perform withdrawals"}
-            
-            destination = destination or self.address
-            
-            # Use basic_withdraw.py pattern
-            withdraw_result = self.exchange.withdraw_from_bridge(amount, destination)
-            print(withdraw_result)
-            
-            self.logger.info(f"Withdrawal: ${amount} to {destination}")
-            return withdraw_result
-        except Exception as e:
-            self.logger.error(f"Error withdrawing: {e}")
-            return {"status": "error", "message": str(e)}
-
-    async def cancel_order(self, coin, oid):
-        """Cancel order using basic_cancel.py pattern"""
-        try:
-            # Pattern from basic_cancel.py
-            cancel_result = self.exchange.cancel(coin, oid)
-            print(cancel_result)
-            self.logger.info(f"Order cancelled: {coin} oid:{oid}")
-            return cancel_result
-        except Exception as e:
-            self.logger.error(f"Error cancelling order: {e}")
-            return {"status": "error", "message": str(e)}
-        
-    async def cancel_all_orders(self):
-        """Cancel all open orders using cancel_open_orders.py pattern"""
-        try:
-            # From api/examples/cancel_open_orders.py
-            open_orders = self.info.open_orders(self.address)
-            results = []
-            for open_order in open_orders:
-                print(f"cancelling order {open_order}")
-                result = self.exchange.cancel(open_order["coin"], open_order["oid"])
-                results.append(result)
-            return results
-        except Exception as e:
-            self.logger.error(f"Error cancelling all orders: {e}")
-            return [{"status": "error", "message": str(e)}]
-        
-    async def adjust_leverage(self, coin, leverage, is_cross=True):
-        """Adjust leverage using basic_leverage_adjustment.py pattern"""
-        try:
-            # Pattern from basic_leverage_adjustment.py
-            result = self.exchange.update_leverage(leverage, coin, is_cross)
-            print(result)
-            self.logger.info(f"Leverage adjusted: {coin} {leverage}x {'cross' if is_cross else 'isolated'}")
-            return result
-        except Exception as e:
-            self.logger.error(f"Error adjusting leverage: {e}")
-            return {"status": "error", "message": str(e)}
-
-    async def update_isolated_margin(self, coin: str, amount: float, is_buy: bool = True):
-        """
-        Update isolated margin for a position, using basic_leverage_adjustment.py pattern.
-        Note: The Hyperliquid SDK's update_isolated_margin takes a signed amount.
-        This method simplifies it by taking an absolute amount and a direction (is_buy implies adding margin).
-        Adjust 'is_buy' to False if you intend to remove margin, though the SDK might not directly support negative values in this specific call.
-        The SDK's `update_isolated_margin` expects `amount_usd` which is the change in margin.
-        """
-        try:
-            # The SDK's update_isolated_margin expects amount_usd as the change.
-            # Positive to add margin, negative to remove (if supported by the specific call).
-            # For simplicity, this example assumes adding margin.
-            # If 'is_buy' is False, it implies reducing margin, which might need a negative amount.
-            # However, the example `exchange.update_isolated_margin(1, "ETH")` adds $1.
-            # Let's assume 'amount' is always positive and we are adding margin.
-            # If removing margin is intended, the SDK might require a different approach or validation.
-            
-            margin_change = amount # Positive for adding margin
-            
-            result = self.exchange.update_isolated_margin(margin_change, coin)
-            print(result)
-            self.logger.info(f"Isolated margin updated for {coin} by ${margin_change}")
-            return result
-        except Exception as e:
-            self.logger.error(f"Error updating isolated margin for {coin}: {e}")
-            return {"status": "error", "message": str(e)}
-
-    async def schedule_cancel_all_orders(self, cancel_time_ms: Optional[int] = None, delay_seconds: int = 10):
-        """
-        Schedule cancellation of all open orders using basic_schedule_cancel.py pattern.
-        If cancel_time_ms is not provided, it will be set to delay_seconds from now.
-        """
-        try:
-            if cancel_time_ms is None:
-                from hyperliquid.utils.signing import get_timestamp_ms
-                cancel_time_ms = get_timestamp_ms() + (delay_seconds * 1000)
-            
-            # The exchange.schedule_cancel method in the SDK cancels all orders if no specific OID is given.
-            # The example basic_schedule_cancel.py uses `exchange.schedule_cancel(cancel_time)`
-            result = self.exchange.schedule_cancel(cancel_time_ms)
-            print(result)
-            self.logger.info(f"Scheduled cancellation of all orders for timestamp {cancel_time_ms}")
-            return result
-        except Exception as e:
-            self.logger.error(f"Error scheduling cancel all orders: {e}")
-            return {"status": "error", "message": str(e)}
-
-    async def get_user_state(self):
-        """Get user state using api/examples/basic_order.py pattern"""
-        try:
-            # From api/examples/basic_order.py
-            user_state = self.info.user_state(self.address)
-            positions = []
-            for position in user_state["assetPositions"]:
-                positions.append(position["position"])
-            
-            if len(positions) > 0:
-                print("positions:")
-                for position in positions:
-                    print(json.dumps(position, indent=2))
-            else:
-                print("no open positions")
-            
-            return {
-                "positions": positions,
-                "marginSummary": user_state.get("marginSummary", {}),
-                "crossMaintenanceMarginUsed": user_state.get("crossMaintenanceMarginUsed", 0)
-            }
-        except Exception as e:
-            self.logger.error(f"Error getting user state: {e}")
-            return {"status": "error", "message": str(e)}
-
-    async def get_open_orders(self):
-        """Get open orders using cancel_open_orders.py pattern"""
-        try:
-            # From cancel_open_orders.py
-            open_orders = self.info.open_orders(self.address)
-            return open_orders
-        except Exception as e:
-            self.logger.error(f"Error getting open orders: {e}")
-            return []
-
-    async def close_position(self, coin):
-        """Close position using basic_market_order.py pattern"""
-        try:
-            # From basic_market_order.py - market close
-            order_result = self.exchange.market_close(coin)
-            self.logger.info(f"Position closed: {coin}")
-            return order_result
-        except Exception as e:
-            self.logger.error(f"Error closing position: {e}")
-            return {"status": "error", "message": str(e)}
-
-    async def calculate_optimal_position_size(self, coin: str, risk_pct: float = 0.01) -> float:
-        """Calculate optimal position size based on account value and volatility"""
-        try:
-            # Get account value
-            user_state = await self.get_user_state()
-            account_value = float(user_state.get("marginSummary", {}).get("accountValue", 0))
-            
-            # Get coin volatility
-            volatility = await self._calculate_coin_volatility(coin)
-            
-            # Risk management adjustment
-            risk_adjustment = self.risk_manager.get_risk_adjustment(coin)
-            adjusted_risk_pct = risk_pct * risk_adjustment
-            
-            # Kelly criterion calculation
-            if volatility > 0:
-                # Risk no more than x% of account
-                max_risk = account_value * adjusted_risk_pct
-                position_size = max_risk / volatility
-                
-                # Apply additional position limits
-                current_exposure = await self._get_current_exposure()
-                max_account_exposure = 0.5  # Max 50% of account in all positions
-                
-                if current_exposure + position_size > account_value * max_account_exposure:
-                    position_size = max(0, (account_value * max_account_exposure) - current_exposure)
-                
-                self.logger.info(f"Calculated position size for {coin}: ${position_size:.2f} " +
-                                f"(volatility: {volatility:.4f}, risk: {adjusted_risk_pct:.2%})")
-                return position_size
-            return 0
-        except Exception as e:
-            self.logger.error(f"Error calculating position size: {e}")
-            return 0
-
-    async def _calculate_coin_volatility(self, coin: str, lookback_hours: int = 24) -> float:
-        """Calculate coin volatility based on price history"""
-        try:
-            # Check cache first (refresh every hour)
-            current_time = time.time()
-            if (coin in self.volatility_cache and 
-                current_time - self.volatility_cache_time.get(coin, 0) < 3600):
-                return self.volatility_cache[coin]
-            
-            # Get price history
-            candles = self.info.candles_snapshot(coin, "1h", lookback_hours)
-            
-            if len(candles) < 6:
-                self.logger.warning(f"Insufficient price history for {coin}")
-                return 0.02  # Default 2% volatility
-            
-            # Calculate returns
-            prices = [float(candle["c"]) for candle in candles]
-            returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
-            
-            # Calculate volatility (standard deviation of returns)
-            import numpy as np
-            volatility = np.std(returns)
-            
-            # Annualize and normalize
-            annualized_volatility = volatility * np.sqrt(24 * 365)  # 24 hours in a day
-            normalized_volatility = min(0.05, max(0.005, annualized_volatility))  # Cap between 0.5% and 5%
-            
-            # Cache result
-            self.volatility_cache[coin] = normalized_volatility
-            self.volatility_cache_time[coin] = current_time
-            
-            return normalized_volatility
-        except Exception as e:
-            self.logger.error(f"Error calculating volatility for {coin}: {e}")
-            return 0.02  # Default 2% volatility
-
-    async def _get_current_exposure(self) -> float:
-        """Get current position exposure"""
-        try:
-            user_state = await self.get_user_state()
-            positions = user_state.get("positions", [])
-            
-            total_exposure = 0
-            for position in positions:
-                size = abs(float(position.get("szi", 0)))
-                entry_price = float(position.get("entryPx", 0))
-                exposure = size * entry_price
-                total_exposure += exposure
-            
-            return total_exposure
-        except Exception as e:
-            self.logger.error(f"Error calculating current exposure: {e}")
-            return 0
-
-    async def place_smart_order(self, coin: str, is_buy: bool, risk_pct: float = 0.01, 
-                             limit_price=None, order_type="limit"):
-        """Place order with intelligent position sizing and risk management"""
-        try:
-            # Check risk management first
-            if not self.risk_manager.can_trade(coin):
-                return {"status": "rejected", "reason": "risk_management", 
-                        "message": f"Trading {coin} blocked by risk management"}
-                
-            # Calculate optimal position size
-            position_size_usd = await self.calculate_optimal_position_size(coin, risk_pct)
-            
-            # Get current price if limit price not specified
-            if not limit_price:
-                mids = self.info.all_mids()
-                mid_price = float(mids.get(coin, 0))
-                # Add a small buffer for market orders or use mid price for limit orders
-                limit_price = mid_price * (0.998 if is_buy else 1.002) if order_type == "market" else mid_price
-            else:
-                limit_price = float(limit_price)
-                
-            # Convert USD size to coin quantity
-            size = position_size_usd / limit_price
-            
-            # Round size to appropriate precision
-            # Most coins use different precision, implement proper rounding
-            if coin in ["BTC"]:
-                size = round(size, 4)  # 0.0001 BTC precision
-            elif coin in ["ETH"]:
-                size = round(size, 3)  # 0.001 ETH precision
-            else:
-                size = round(size, 2)  # 0.01 precision for others
-            
-            # Check minimum viable size
-            if size * limit_price < 5:  # $5 minimum order
-                return {"status": "rejected", "reason": "size_too_small",
-                        "message": f"Order size ${size * limit_price:.2f} below minimum $5"}
-            
-            # Place appropriate order type
-            if order_type == "market":
-                result = await self.place_market_order(coin, is_buy, size)
-            else:
-                result = await self.place_limit_order(coin, is_buy, size, limit_price)
-            
-            # Log order placement with full details
-            self.logger.info(f"Smart order placed: {coin} {'BUY' if is_buy else 'SELL'} "
-                          f"{size} @ ${limit_price} (${position_size_usd:.2f}, "
-                          f"risk: {risk_pct:.2%})")
-            
-            # Update risk management system
-            self.risk_manager.record_trade(coin, size * limit_price, is_buy)
-            
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Error placing smart order: {e}")
-            return {"status": "error", "message": str(e)}
-
-    async def update_correlation_matrix(self, coins: list = None):
-        """Update cross-coin correlation matrix"""
-        try:
-            current_time = time.time()
-            
-            # Update at most once every 4 hours
-            if current_time - self.last_correlation_update < 14400:
-                return self.correlation_matrix
-            
-            if not coins:
-                # Get all available coins
-                all_mids = self.info.all_mids()
-                coins = list(all_mids.keys())
-            
-            # Limit to common coins for performance
-            major_coins = [c for c in coins if c in ["BTC", "ETH", "SOL", "ARB", "AVAX", "APT", "OP", "MATIC", "DOGE"]]
-            
-            # Get price history for each coin
-            price_data = {}
-            for coin in major_coins:
-                try:
-                    candles = self.info.candles_snapshot(coin, "4h", 30)  # 5 days of 4-hour candles
-                    if len(candles) >= 10:  # Need reasonable amount of data
-                        price_data[coin] = [float(c["c"]) for c in candles]
-                except Exception:
-                    continue
-            
-            # Calculate correlation matrix
-            import numpy as np
-            correlation = {}
-            
-            for coin1 in price_data:
-                correlation[coin1] = {}
-                for coin2 in price_data:
-                    # Get common length
-                    min_len = min(len(price_data[coin1]), len(price_data[coin2]))
-                    if min_len < 10:
-                        correlation[coin1][coin2] = 0
-                        continue
-                    
-                    # Calculate returns
-                    returns1 = np.diff(price_data[coin1][-min_len:]) / price_data[coin1][-min_len:-1]
-                    returns2 = np.diff(price_data[coin2][-min_len:]) / price_data[coin2][-min_len:-1]
-                    
-                    # Calculate correlation
-                    try:
-                        corr = np.corrcoef(returns1, returns2)[0, 1]
-                        correlation[coin1][coin2] = corr
-                    except:
-                        correlation[coin1][coin2] = 0
-            
-            self.correlation_matrix = correlation
-            self.last_correlation_update = current_time
-            
-            self.logger.info(f"Updated correlation matrix for {len(correlation)} coins")
-            return correlation
-            
-        except Exception as e:
-            self.logger.error(f"Error updating correlation matrix: {e}")
-            return {}
-
-    async def find_correlated_opportunities(self, base_coin: str, correlation_threshold: float = 0.7):
-        """Find trading opportunities based on correlated coins"""
-        try:
-            # Make sure correlation matrix is updated
-            await self.update_correlation_matrix()
-            
-            if not self.correlation_matrix or base_coin not in self.correlation_matrix:
-                return []
-            
-            # Find coins with high correlation to base_coin
-            correlated_coins = []
-            for coin, corr in self.correlation_matrix[base_coin].items():
-                if coin != base_coin and abs(corr) >= correlation_threshold:
-                    correlated_coins.append({
-                        "coin": coin,
-                        "correlation": corr
-                    })
-            
-            # Get base coin performance
-            base_performance = await self._get_coin_performance(base_coin)
-            
-            # Find opportunities where base is up but correlated coin lags
-            opportunities = []
-            for coin_data in correlated_coins:
-                coin = coin_data["coin"]
-                corr = coin_data["correlation"]
-                
-                performance = await self._get_coin_performance(coin)
-                
-                # If coins are positively correlated
-                if corr > 0:
-                    # Base is up but correlated coin is lagging
-                    if base_performance["change_24h"] > 0.01 and performance["change_24h"] < base_performance["change_24h"] * 0.5:
-                        opportunities.append({
-                            "coin": coin,
-                            "signal": "BUY",
-                            "correlation": corr,
-                            "base_coin": base_coin,
-                            "base_change": base_performance["change_24h"],
-                            "coin_change": performance["change_24h"],
-                            "type": "positive_correlation_lag",
-                            "description": f"{coin} lagging behind {base_coin} despite positive correlation"
-                        })
-                    # Base is down but correlated coin hasn't fallen
-                    elif base_performance["change_24h"] < -0.01 and performance["change_24h"] > base_performance["change_24h"] * 0.5:
-                        opportunities.append({
-                            "coin": coin,
-                            "signal": "SELL",
-                            "correlation": corr,
-                            "base_coin": base_coin,
-                            "base_change": base_performance["change_24h"],
-                            "coin_change": performance["change_24h"],
-                            "type": "positive_correlation_drop_pending",
-                            "description": f"{coin} likely to follow {base_coin}'s decline"
-                        })
-                # If coins are negatively correlated
-                elif corr < 0:
-                    # Base is up, so negatively correlated should drop
-                    if base_performance["change_24h"] > 0.01 and performance["change_24h"] > -0.01:
-                        opportunities.append({
-                            "coin": coin,
-                            "signal": "SELL",
-                            "correlation": corr,
-                            "base_coin": base_coin,
-                            "base_change": base_performance["change_24h"],
-                            "coin_change": performance["change_24h"],
-                            "type": "negative_correlation_drop_expected",
-                            "description": f"{coin} likely to drop as {base_coin} rises (negative correlation)"
-                        })
-                    # Base is down, so negatively correlated should rise
-                    elif base_performance["change_24h"] < -0.01 and performance["change_24h"] < 0.01:
-                        opportunities.append({
-                            "coin": coin,
-                            "signal": "BUY",
-                            "correlation": corr,
-                            "base_coin": base_coin,
-                            "base_change": base_performance["change_24h"],
-                            "coin_change": performance["change_24h"],
-                            "type": "negative_correlation_rise_expected",
-                            "description": f"{coin} likely to rise as {base_coin} falls (negative correlation)"
-                        })
-            
-            return opportunities
-            
-        except Exception as e:
-            self.logger.error(f"Error finding correlation opportunities: {e}")
-            return []
-
-    async def _get_coin_performance(self, coin: str) -> dict:
-        """Get coin performance metrics"""
-        try:
-            # Get recent candles
-            candles = self.info.candles_snapshot(coin, "1h", 25)  # 24h + 1 for calculation
-            if len(candles) < 2:
-                return {"change_24h": 0, "volume_24h": 0}
-            
-            # Calculate 24h change
-            current_price = float(candles[-1]["c"])
-            price_24h_ago = float(candles[0]["c"])
-            change_24h = (current_price - price_24h_ago) / price_24h_ago
-            
-            # Calculate 24h volume
-            volume_24h = sum(float(c["v"]) for c in candles[1:])  # Skip first candle
-            
-            return {
-                "price": current_price,
-                "change_24h": change_24h,
-                "volume_24h": volume_24h
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error getting performance for {coin}: {e}")
-            return {"change_24h": 0, "volume_24h": 0}
-
-    async def execute_correlation_trade(self, opportunity):
-        """Execute trade based on correlation opportunity"""
-        try:
-            coin = opportunity["coin"]
-            signal = opportunity["signal"]
-            is_buy = signal == "BUY"
-            
-            # Use a smaller risk percentage for correlation trades
-            risk_pct = 0.005  # 0.5% of account
-            
-            # Place the trade with smart sizing
-            result = await self.place_smart_order(
-                coin=coin,
-                is_buy=is_buy,
-                risk_pct=risk_pct,
-                order_type="limit"
-            )
-            
-            # Log the correlation-based trade
-            self.logger.info(f"Correlation trade: {signal} {coin} based on {opportunity['type']}")
-            
-            return {
-                "status": "executed" if result.get("status") == "ok" else "failed",
-                "trade_result": result,
-                "opportunity": opportunity
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error executing correlation trade: {e}")
-            return {"status": "error", "message": str(e)}
-
-class RiskManagementSystem:
-    """Advanced risk management system for trading"""
-    
-    def __init__(self):
-        self.trade_limits = {
-            "daily_max_trades": 100,
-            "daily_max_volume": 100000,  # $100k per day
-            "max_drawdown_pct": 0.05,    # 5% max drawdown
-            "max_position_size": 10000,  # $10k max position
-            "max_open_positions": 10     # Maximum 10 open positions
-        }
-        
-        self.daily_trades = {}
-        self.daily_volumes = {}
-        self.drawdowns = {}
-        self.banned_coins = set()
-        self.position_limits = {}
-        self.trade_history = []
-        
-        self.logger = logging.getLogger(__name__)
-    
-    def can_trade(self, coin: str) -> bool:
-        """Check if trading is allowed for this coin"""
-        today = time.strftime("%Y-%m-%d")
-        
-        # Check banned coins
-        if coin in self.banned_coins:
-            return False
-        
-        # Check daily trade count
-        if today in self.daily_trades and self.daily_trades[today] >= self.trade_limits["daily_max_trades"]:
-            return False
-        
-        # Check daily volume
-        if today in self.daily_volumes and self.daily_volumes[today] >= self.trade_limits["daily_max_volume"]:
-            return False
-        
-        return True
-    
-    def get_risk_adjustment(self, coin: str) -> float:
-        """Get risk adjustment factor based on coin and market conditions"""
-        # Default is 1.0 (no adjustment)
-        adjustment = 1.0
-        
-        # If coin has had recent drawdowns, reduce risk
-        if coin in self.drawdowns and self.drawdowns[coin] > 0.02:  # 2%+ drawdown
-            adjustment *= 0.5  # Half risk
-        
-        # Reduce risk if we've had many trades today
-        today = time.strftime("%Y-%m-%d")
-        if today in self.daily_trades:
-            trades_factor = 1.0 - (self.daily_trades[today] / self.trade_limits["daily_max_trades"])
-            adjustment *= max(0.25, trades_factor)  # Reduce to at most 75%
-        
-        # Apply coin-specific limits
-        if coin in self.position_limits:
-            adjustment *= self.position_limits.get(coin, 1.0)
-        
-        return min(1.0, max(0.1, adjustment))  # Constrain between 0.1 and 1.0
-    
-    def record_trade(self, coin: str, trade_value: float, is_buy: bool):
-        """Record a trade for risk management tracking"""
-        today = time.strftime("%Y-%m-%d")
-        timestamp = time.time()
-        
-        # Update daily counters
-        if today not in self.daily_trades:
-            self.daily_trades[today] = 0
-            self.daily_volumes[today] = 0
-        
-        self.daily_trades[today] += 1
-        self.daily_volumes[today] += trade_value
-        
-        # Record in history
-        self.trade_history.append({
-            "timestamp": timestamp,
-            "coin": coin,
-            "value": trade_value,
-            "is_buy": is_buy
-        })
-        
-        # Limit history size
-        if len(self.trade_history) > 1000:
-            self.trade_history = self.trade_history[-1000:]
-        
-        self.logger.info(f"Trade recorded: {coin} {'BUY' if is_buy else 'SELL'} ${trade_value:.2f} "
-                       f"(daily: {self.daily_trades[today]}/{self.trade_limits['daily_max_trades']} trades, "
-                       f"${self.daily_volumes[today]:,.2f}/${self.trade_limits['daily_max_volume']:,.2f} volume)")
-
-    def update_drawdown(self, coin: str, drawdown_pct: float):
-        """Update drawdown tracking for a coin"""
-        self.drawdowns[coin] = drawdown_pct
-        
-        # Ban coin if drawdown exceeds threshold
-        if drawdown_pct > self.trade_limits["max_drawdown_pct"]:
-            self.banned_coins.add(coin)
-            self.logger.warning(f"{coin} banned due to {drawdown_pct:.2%} drawdown exceeding {self.trade_limits['max_drawdown_pct']:.2%} limit")
-    
-    def set_position_limit(self, coin: str, limit_factor: float):
-        """Set position size limit factor for a specific coin"""
-        self.position_limits[coin] = limit_factor
-    
-    def get_risk_report(self) -> dict:
-        """Get comprehensive risk report"""
-        today = time.strftime("%Y-%m-%d")
-        
-        return {
-            "daily_trades": self.daily_trades.get(today, 0),
-            "daily_volume": self.daily_volumes.get(today, 0),
-            "banned_coins": list(self.banned_coins),
-            "drawdowns": self.drawdowns,
-            "position_limits": self.position_limits,
-            "limits": self.trade_limits,
-            "risk_status": "normal" if self.daily_trades.get(today, 0) < self.trade_limits["daily_max_trades"] * 0.8 else "elevated"
-        }

@@ -9,9 +9,11 @@ import json
 import sys
 import os
 from pathlib import Path
+import threading
 from typing import Dict, Optional
 
 from trading_engine.vault_manager import VaultManager
+from eth_account import Account # Add Account import for main() if needed for auth check logic
 
 # Add current directory to Python path to fix imports
 current_dir = Path(__file__).parent
@@ -22,7 +24,7 @@ from database import Database
 
 from trading_engine.core_engine import TradingEngine
 from trading_engine.websocket_manager import HyperliquidWebSocketManager
-from telegram_bot.bot import HyperliquidTradingBot
+from telegram_bot.bot import TelegramTradingBot # Corrected class name if it was HyperliquidTradingBot
 from strategies.grid_trading_engine import GridTradingEngine
 from strategies.automated_trading import AutomatedTrading
 from strategies.hyperliquid_profit_bot import HyperliquidProfitBot
@@ -30,22 +32,51 @@ from strategies.hyperliquid_profit_bot import HyperliquidProfitBot
 # Hyperliquid SDK imports
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
-from hyperliquid.utils import constants
+from hyperliquid.utils import constants # Ensure this is present
 
 # Import examples for setup
 examples_dir = Path(__file__).parent / 'examples'
 sys.path.append(str(examples_dir))
-import example_utils
+import example_utils # Ensure this is present
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('hyperliquid_bot.log'),
-        logging.StreamHandler()
+        logging.FileHandler('hyperliquid_bot.log', encoding='utf-8'), # Also ensure file handler uses utf-8
+        logging.StreamHandler(sys.stdout) # We will configure this handler separately
     ]
 )
+
+# Configure StreamHandler to use UTF-8
+# Get the root logger
+root_logger = logging.getLogger()
+# Find the StreamHandler and set its encoding
+for handler in root_logger.handlers:
+    if isinstance(handler, logging.StreamHandler) and handler.stream == sys.stdout:
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        # For Windows, explicitly set encoding if possible, or rely on PYTHONIOENCODING
+        # Python 3.7+ on Windows 10 (1903+) should handle UTF-8 better by default if console supports it.
+        # If issues persist, ensuring the console itself is set to UTF-8 (e.g., chcp 65001) is key.
+        # Forcing encoding on the handler can sometimes be tricky if the underlying stream doesn't support it well.
+        # A common robust way is to ensure PYTHONIOENCODING=utf-8 is set in the environment.
+        # However, we can try to explicitly set it for the handler's stream if it's sys.stdout.
+        try:
+            sys.stdout.reconfigure(encoding='utf-8') # Python 3.7+
+        except AttributeError: # Older Python or non-reconfigurable stream
+            # Fallback: Wrap the stream if necessary, though less ideal.
+            # For now, we'll assume modern Python/OS handles it or PYTHONIOENCODING is used.
+            pass 
+        # If direct reconfiguration or PYTHONIOENCODING isn't enough, one might need to
+        # create a new StreamHandler with an explicitly wrapped stream:
+        # import codecs
+        # console_handler = logging.StreamHandler(codecs.getwriter('utf-8')(sys.stdout))
+        # console_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        # root_logger.addHandler(console_handler)
+        # And remove the original StreamHandler if it was added by basicConfig.
+        # For simplicity, we'll rely on reconfigure or PYTHONIOENCODING for now.
+
 
 logger = logging.getLogger(__name__)
 
@@ -81,24 +112,21 @@ class HyperliquidAlphaBot:
                 config = json.load(f)
             
             # Set defaults if not present
-            if 'hyperliquid' not in config:
-                config['hyperliquid'] = {
-                    'api_url': constants.TESTNET_API_URL,
-                    'mainnet': False
-                }
+            hl_config = config.setdefault('hyperliquid', {})
+            hl_config.setdefault('api_url', constants.TESTNET_API_URL)
+            hl_config.setdefault('mainnet', hl_config['api_url'] == constants.MAINNET_API_URL)
+            hl_config.setdefault('use_agent_for_core_operations', False) # New option
+
+            config.setdefault('vault', {
+                'address': '',
+                'minimum_deposit': 50,
+                'performance_fee': 0.10
+            })
             
-            if 'vault' not in config:
-                config['vault'] = {
-                    'address': '',
-                    'minimum_deposit': 50,
-                    'performance_fee': 0.10
-                }
-            
-            if 'telegram' not in config:
-                config['telegram'] = {
-                    'bot_token': '',
-                    'allowed_users': []
-                }
+            config.setdefault('telegram', {
+                'bot_token': '',
+                'allowed_users': []
+            })
             
             # Validate required fields
             if not config['telegram']['bot_token']:
@@ -116,39 +144,55 @@ class HyperliquidAlphaBot:
         try:
             logger.info("🔧 Initializing HyperliquidAlphaBot components...")
             
-            # 1. Initialize Hyperliquid SDK using example_utils pattern with enhanced error handling
+            # 1. Initialize Hyperliquid SDK
             logger.info("🔗 Setting up Hyperliquid API connection...")
             try:
+                # Use the enhanced example_utils.setup
                 base_url = self.config['hyperliquid']['api_url']
+                # The new example_utils.setup handles agent vs direct key logic internally
+                # It will prioritize agent_config.json if available.
                 self.address, self.info, self.exchange = example_utils.setup(base_url, skip_ws=True)
                 
-                # Test the connection
+                # Test the connection using the address returned by setup()
+                # This address will be the main_address if an agent is used, or the direct wallet address otherwise.
                 user_state = self.info.user_state(self.address)
                 account_value = float(user_state.get('marginSummary', {}).get('accountValue', 0))
                 
-                logger.info(f"✅ Connected to Hyperliquid API at {self.address}")
+                logger.info(f"✅ Connected to Hyperliquid API. Active address: {self.address}")
                 logger.info(f"📊 Account value: ${account_value:,.2f}")
                 
                 # Enhanced vault handling from real_trading_bot.py
                 if self.config['vault']['address']:
                     try:
+                        # If using an agent, self.exchange.wallet is the agent's wallet.
+                        # If direct, it's the main wallet.
+                        # The vault_exchange should operate on the vault, potentially using the same wallet
+                        # if the main/agent wallet has permissions, or a dedicated vault wallet.
+                        # For simplicity, assuming the current wallet (main or agent) can interact with the vault.
+                        # If the vault requires the main key specifically, and an agent is active, this might need adjustment.
+                        # However, typically an agent acts on behalf of the main account, which could include vault interactions
+                        # if the vault_address is correctly specified.
                         self.vault_exchange = Exchange(
-                            self.exchange.wallet, 
+                            self.exchange.wallet, # This is the wallet from example_utils.setup() (agent or main)
                             self.exchange.base_url, 
                             vault_address=self.config['vault']['address']
                         )
                         
                         # Test vault connection
+                        # The info client (self.info) can query any address, including the vault.
                         vault_state = self.info.user_state(self.config['vault']['address'])
                         vault_value = float(vault_state.get('marginSummary', {}).get('accountValue', 0))
-                        logger.info(f"🏦 Vault connected: ${vault_value:,.2f}")
+                        logger.info(f"🏦 Vault connected: {self.config['vault']['address']}, Value: ${vault_value:,.2f}")
                         
                     except Exception as e:
-                        logger.warning(f"Vault connection failed: {e}")
+                        logger.warning(f"Vault connection/query failed for {self.config['vault']['address']}: {e}")
                         self.vault_exchange = None
+                else:
+                    self.vault_exchange = None # Ensure it's None if no vault address
                 
             except Exception as e:
                 logger.critical(f"Failed to connect to Hyperliquid API: {e}")
+                logger.critical("Ensure you have run 'python setup_agent.py' or configured 'config.json' correctly.")
                 raise
             
             # 2. Database with connection validation
@@ -168,11 +212,16 @@ class HyperliquidAlphaBot:
             # 3. Core trading engine with validation
             logger.info("⚙️ Initializing core trading engine...")
             try:
+                # Pass the already setup components to TradingEngine
                 self.trading_engine = TradingEngine(
-                    base_url=base_url,
+                    # base_url, address, info, exchange are already attributes of self
+                    # TradingEngine's __init__ needs to be checked if it expects these
+                    # or if it calls example_utils.setup() itself.
+                    # Assuming it can take pre-initialized components:
                     address=self.address,
                     info=self.info,
-                    exchange=self.exchange
+                    exchange=self.exchange,
+                    base_url=base_url # or self.exchange.base_url
                 )
                 
                 # Validate trading engine with test query
@@ -239,23 +288,24 @@ class HyperliquidAlphaBot:
             # 7. Telegram bot with dependency injection
             logger.info("🤖 Initializing Telegram bot...")
             try:
-                self.telegram_bot = HyperliquidTradingBot(
-                    config_path="telegram_bot/bot_config.json"
+                # Use token and config from main HyperliquidAlphaBot config
+                self.telegram_bot = TelegramTradingBot(
+                    token=self.config['telegram']['bot_token'],
+                    config=self.config, # Pass the main bot's config
+                    vault_manager=self.vault_manager,
+                    trading_engine=self.trading_engine,
+                    strategies=self.strategies,
+                    database=self.database,
+                    ws_manager=self.ws_manager
+                    # user_manager can be added if/when implemented
                 )
                 
-                # Inject dependencies
-                self.telegram_bot.vault_manager = self.vault_manager
-                self.telegram_bot.trading_engine = self.trading_engine
-                self.telegram_bot.strategies = self.strategies
-                self.telegram_bot.database = self.database
-                self.telegram_bot.ws_manager = self.ws_manager
-                
-                # Test bot initialization
-                await self.telegram_bot.initialize()
+                # The new TelegramTradingBot setup_handlers in __init__.
+                # No separate initialize() method is called here.
                 logger.info("✅ Telegram bot initialized with all dependencies")
                 
             except Exception as e:
-                logger.error(f"Telegram bot initialization failed: {e}")
+                logger.error(f"Telegram bot initialization failed: {e}", exc_info=True)
                 self.telegram_bot = None
                 logger.warning("⚠️ Continuing without Telegram bot")
             
@@ -579,12 +629,30 @@ class HyperliquidAlphaBot:
             self.running = True
             await self.start_background_tasks()
             
-            # Start Telegram bot
-            logger.info("🤖 Starting Telegram bot...")
-            await self.telegram_bot.run()
+            # Start Telegram bot polling
+            if self.telegram_bot:
+                logger.info("🤖 Starting Telegram bot polling...")
+                # Start Telegram bot in a separate thread
+                def run_telegram_bot():
+                    import asyncio
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    self.telegram_bot.app.run_polling(close_loop=False)
+                
+                telegram_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+                telegram_thread.start()
+                logger.info("🤖 Telegram bot started in separate thread")
+            else:
+                logger.warning("Telegram bot not initialized, cannot start polling.")
             
+            logger.info("✅ Hyperliquid Alpha Bot main components started. Telegram bot polling in background.")
+            # Keep the main bot alive, e.g., by waiting for a shutdown event or sleeping
+            while self.running:
+                await asyncio.sleep(1)
+
         except Exception as e:
-            logger.error(f"Failed to start bot: {e}")
+            logger.error(f"Failed to start bot: {e}", exc_info=True)
+            await self.stop() # Attempt to gracefully stop if start fails
             raise
     
     async def stop(self):
@@ -592,29 +660,41 @@ class HyperliquidAlphaBot:
         try:
             logger.info("🛑 Stopping Hyperliquid Alpha Trading Bot...")
             
-            self.running = False
+            self.running = False # Signal background tasks to stop
             
-            # Stop Telegram bot
-            if self.telegram_bot:
-                await self.telegram_bot.stop()
-            
+            # Stop Telegram bot polling if it's running
+            if self.telegram_bot and self.telegram_bot.app and self.telegram_bot.app.running:
+                logger.info("Stopping Telegram bot polling...")
+                await self.telegram_bot.app.stop() # Gracefully stop polling
+                # await self.telegram_bot.app.shutdown() # More forceful if stop() isn't enough
+
+            # Add cleanup for other async tasks if they were started with asyncio.create_task
+            # For example, cancel them:
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if tasks:
+                logger.info(f"Cancelling {len(tasks)} background tasks...")
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                logger.info("Background tasks cancelled.")
+
             # Close database connection
-            if self.database:
+            if self.database and hasattr(self.database, 'close') and asyncio.iscoroutinefunction(self.database.close):
                 await self.database.close()
             
             logger.info("✅ Bot stopped successfully")
             
         except Exception as e:
-            logger.error(f"Error stopping bot: {e}")
+            logger.error(f"Error stopping bot: {e}", exc_info=True)
 
 def create_default_config():
-    """Create default configuration file"""
+    """Create default configuration file for the bot (config.json in root)"""
     default_config = {
         "hyperliquid": {
-            "api_url": constants.TESTNET_API_URL,
+            "api_url": constants.TESTNET_API_URL, # Default to TESTNET
             "mainnet": False,
-            "account_address": "",
-            "secret_key": ""
+            # "account_address": "" # This will be populated by example_utils.setup from private key
+            "use_agent_for_core_operations": False # New option
         },
         "vault": {
             "address": "",
@@ -646,52 +726,90 @@ def create_default_config():
     with open("config.json", "w") as f:
         json.dump(default_config, f, indent=2)
     
-    logger.info("✅ Created default config.json")
+    logger.info("✅ Created default config.json (for bot settings in root directory)")
+    logger.info("IMPORTANT: For Hyperliquid authentication, ensure HYPERLIQUID_PRIVATE_KEY environment variable is set,")
+    logger.info("OR 'examples/config.json' contains your 'secret_key'.")
+    logger.info("To use an agent wallet for core bot operations, set 'use_agent_for_core_operations: true' in this config.json,")
+    logger.info("and ensure the main wallet key is available for the agent creation process if 'agent_config.json' doesn't exist.")
     return default_config
 
 async def main():
     """Main entry point with comprehensive error handling"""
+    bot_instance = None # Define bot_instance outside try block for finally
     try:
-        # Check if config exists
-        config_path = Path("config.json")
-        if not config_path.exists():
-            logger.info("📝 Creating default configuration...")
-            create_default_config()
-            logger.error("❌ Please update config.json with your settings and restart")
-            logger.error("   1. Add your Telegram bot token")
-            logger.error("   2. Add your Hyperliquid account details")
-            logger.error("   3. Set your vault address")
+        # --- Hyperliquid Authentication Guidance (for example_utils.py) ---
+        # This part is for the bot's own core operations if it uses example_utils.setup()
+        # The new example_utils.setup handles agent vs direct key logic internally
+        # It will prioritize agent_config.json if available.
+        examples_config_path = Path(__file__).parent / 'examples' / 'config.json'
+        private_key_env = os.environ.get('HYPERLIQUID_PRIVATE_KEY')
+
+        if not private_key_env and not examples_config_path.exists():
+            logger.error(f"❌ CRITICAL: Hyperliquid authentication not configured.")
+            logger.error(f"  Neither HYPERLIQUID_PRIVATE_KEY environment variable is set,")
+            logger.error(f"  nor is '{examples_config_path}' (with a 'secret_key') found.")
+            logger.error(f"  Please configure one of these for the bot's main wallet.")
+            logger.error(f"  See documentation for HYPERLIQUID_PRIVATE_KEY or format of '{examples_config_path}'.")
+            # Optionally, create a template examples/config.json to guide the user
+            if not examples_config_path.parent.exists():
+                examples_config_path.parent.mkdir(parents=True, exist_ok=True)
+            if not examples_config_path.exists():
+                try:
+                    with open(examples_config_path, "w") as f:
+                        json.dump({"secret_key": "0xYourEthereumPrivateKeyHere", "account_address": "YourOptionalAccountAddressHere"}, f, indent=2)
+                    logger.info(f"Created a template '{examples_config_path}'. Please edit it with your details.")
+                except Exception as e_cfg:
+                    logger.error(f"Could not create template examples/config.json: {e_cfg}")
             return
-        
-        # Load and validate config
-        with open("config.json", 'r') as f:
+        elif private_key_env:
+             logger.info(f"HYPERLIQUID_PRIVATE_KEY environment variable found. It will be prioritized by example_utils.setup().")
+        elif examples_config_path.exists():
+            logger.info(f"Found '{examples_config_path}'. It will be used by example_utils.setup() if HYPERLIQUID_PRIVATE_KEY is not set.")
+
+
+        # --- Bot Configuration Setup (root config.json) ---
+        bot_config_path = Path("config.json")
+        if not bot_config_path.exists():
+            logger.info("📝 Bot's root config.json not found. Creating default configuration...")
+            create_default_config() # This creates the bot's own config.json in the root directory
+            logger.info(f"ℹ️ Please review and update '{bot_config_path}' with your Telegram token, etc.")
+            # No need to return here if examples/config.json or env var handles auth
+
+        # Load and validate bot's root config
+        with open(bot_config_path, 'r') as f:
             config = json.load(f)
         
-        # Check required fields
         if config.get('telegram', {}).get('bot_token', '') in ['', 'GET_TOKEN_FROM_BOTFATHER']:
-            logger.error("❌ Please set your Telegram bot token in config.json")
+            logger.error(f"❌ Please set your Telegram bot token in '{bot_config_path}'")
             logger.error("   Get token from @BotFather: https://t.me/BotFather")
             return
         
         # Create and start the bot
-        bot = HyperliquidAlphaBot()
+        bot_instance = HyperliquidAlphaBot()
         
         try:
-            await bot.start()
+            await bot_instance.start()
         except KeyboardInterrupt:
             logger.info("Received shutdown signal...")
-            await bot.stop()
+            await bot_instance.stop()
         
     except Exception as e:
         logger.error(f"💥 Fatal error: {e}")
         raise
+    finally:
+        if bot_instance and bot_instance.running: # If bot was started and is running
+            logger.info("Initiating graceful shutdown from finally block...")
+            await bot_instance.stop()
+        logger.info("👋 Application has exited.")
 
 if __name__ == "__main__":
-    # Run the bot
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("👋 Shutdown complete!")
+        # This is caught by main's finally block now if bot started
+        logger.info("👋 Main process terminated by KeyboardInterrupt.")
     except Exception as e:
-        logger.error(f"💥 Fatal error: {e}")
-        exit(1)
+        # This will catch errors during asyncio.run(main()) itself or if main() raises before bot starts
+        logger.critical(f"💥 Unhandled critical error in __main__: {e}", exc_info=True)
+        sys.exit(1) # Exit with error code
+

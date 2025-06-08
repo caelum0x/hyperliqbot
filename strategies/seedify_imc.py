@@ -1,40 +1,28 @@
-import asyncio
-import time
-import sys
-import os
-from typing import Dict, List, Optional
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+"""
+Seedify Inventory Market Making module
+"""
+
 import logging
-
+import json
+import time
+import asyncio
 import numpy as np
+from typing import Dict, List, Optional, Any
+import datetime
 
-# Add parent directory to path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Import the base class to avoid circular imports
+from trading_engine.base_trader import BaseTrader
 
-from trading_engine.core_engine import ProfitOptimizedTrader
-
-@dataclass
-class LaunchTracker:
-    """Track upcoming launches for IMC participation"""
-    project_name: str
-    launch_date: datetime
-    min_allocation: float
-    max_allocation: float
-    website: str
-    twitter: str
-    telegram: str
-    completed: bool = False
-
-class SeedifyIMCManager:
+class SeedifyIMCManager(BaseTrader):
     """
     Realistic Seedify IMC management based on actual Hyperliquid features
     """
     
-    def __init__(self, hyperliquid_exchange, hyperliquid_info, config):
-        self.exchange = hyperliquid_exchange
-        self.info = hyperliquid_info
-        self.config = config
+    def __init__(self, hyperliquid_exchange, hyperliquid_info, config, address=None): # Added address parameter
+        # Call BaseTrader's __init__ with expected arguments
+        super().__init__(address=address, info=hyperliquid_info, exchange=hyperliquid_exchange)
+        
+        self.config = config # Store the config specific to SeedifyIMCManager
         self.logger = logging.getLogger(__name__)
         
         # Track user pools for IMC participation
@@ -43,14 +31,6 @@ class SeedifyIMCManager:
         
         # Real referral code for Hyperliquid
         self.referral_code = config.get("referral_code", "")
-        
-        # Initialize integrated trader
-        from trading_engine.core_engine import TradingConfig
-        self.trader = ProfitOptimizedTrader(
-            hyperliquid_exchange, 
-            hyperliquid_info, 
-            TradingConfig()
-        )
     
     async def create_pooled_investment_strategy(self, user_capital: float) -> Dict:
         """Create realistic pooled investment strategy using vault system"""

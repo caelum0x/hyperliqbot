@@ -1,13 +1,21 @@
 {
+  "secret_key": "0x2bad49ecaea6c22d8e2c61574d75c19eef90fa3b3deb72b6747c7c8a310de9f2",
+  "account_address": "0x51662F7518c0AfcCEA0Ed9a702aCAAfE155795e3",
+  "hyperliquid": {
+    "api_url": "https://api.hyperliquid.xyz",
+    "mainnet": true,
+    "use_agent_for_core_operations": true
+  },
   "telegram": {
     "bot_token": "7918996154:AAGt5S3EvG1B-dC-8fiy-eJr-c5HiMyFoME",
-    "instructions": "Bot created! Username: @hyperliqubot - Keep this token secure!"
+    "instructions": "Bot created! Username: @hyperliqubot - Keep this token secure!",
+    "allowed_users": []
   },
-  "base_url": "https://api.hyperliquid-testnet.xyz",
+  "base_url": "https://api.hyperliquid.xyz",
   "referral_code": "HYPERBOT",
   "hyperevm": {
-    "network": "testnet",
-    "rpc_url": "https://api.hyperliquid-testnet-evm.xyz/rpc"
+    "network": "mainnet",
+    "rpc_url": "https://api.hyperliquid.xyz/evm"
   },
   "trading": {
     "max_position_size": 10000,
@@ -15,6 +23,7 @@
     "risk_level": "medium"
   },
   "vault": {
+    "address": "",
     "minimum_deposit": 100,
     "profit_share": 0.1,
     "lockup_days": 1
