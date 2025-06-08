@@ -117,10 +117,10 @@ class TelegramAuthHandler:
             
             logger.info(f"User {user_id} connected with direct wallet: {user_address}")
             
-            # Offer agent wallet option
+            # Offer agent wallet option with user_id in callback data
             keyboard = [
-                [InlineKeyboardButton("🔐 Create Agent Wallet (Recommended)", callback_data="create_agent")], # Simple callback_data
-                [InlineKeyboardButton("📊 View Portfolio", callback_data="view_portfolio")] # Example action
+                [InlineKeyboardButton("🔐 Create Agent Wallet (Recommended)", callback_data=f"create_agent_session_{user_id}")],
+                [InlineKeyboardButton("📊 View Portfolio", callback_data=f"view_portfolio_{user_id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -147,10 +147,10 @@ class TelegramAuthHandler:
                 parse_mode='Markdown'
             )
     
-    async def create_agent_wallet_for_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: # Renamed for clarity
+    async def create_agent_wallet_for_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Create an agent wallet for the user, called via callback"""
         query = update.callback_query
-        await query.answer() # Acknowledge callback
+        await query.answer("Processing agent wallet creation...")
         user_id = query.from_user.id
         
         # Check if user is authenticated (should have a 'direct' session)
@@ -209,9 +209,9 @@ class TelegramAuthHandler:
 
             logger.info(f"Created agent wallet for user {user_id}: {agent_account.address} (main: {main_address})")
             
+            # Update successful creation message with proper callback data
             keyboard = [
-                [InlineKeyboardButton("📊 View Portfolio", callback_data="view_portfolio")],
-                # [InlineKeyboardButton("🚀 Start Trading", callback_data="start_trading")] # Example
+                [InlineKeyboardButton("📊 View Portfolio", callback_data=f"view_portfolio_{user_id}")],
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             

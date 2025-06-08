@@ -65,6 +65,18 @@ class TelegramTradingBot:
 
         # User-specific commands (require auth)
         self.app.add_handler(CommandHandler("portfolio", self.portfolio_command))
+        
+        # Trading control commands
+        self.app.add_handler(CommandHandler("trading_status", self.trading_status_command))
+        self.app.add_handler(CommandHandler("start_trading", self.start_trading_command))
+        self.app.add_handler(CommandHandler("stop_trading", self.stop_trading_command))
+        self.app.add_handler(CommandHandler("start_market_monitoring", self.start_market_monitoring_command))
+        self.app.add_handler(CommandHandler("stop_market_monitoring", self.stop_market_monitoring_command))
+        self.app.add_handler(CommandHandler("start_vault_tracking", self.start_vault_tracking_command))
+        self.app.add_handler(CommandHandler("stop_vault_tracking", self.stop_vault_tracking_command))
+        self.app.add_handler(CommandHandler("start_profit_optimization", self.start_profit_optimization_command))
+        self.app.add_handler(CommandHandler("stop_profit_optimization", self.stop_profit_optimization_command))
+        
         # Add other command handlers for trading, strategies, etc.
 
         # Callback query handlers
@@ -101,14 +113,170 @@ class TelegramTradingBot:
             "`/start` - Welcome message & main menu.\n"
             "`/connect YOUR_KEY` - Securely connect your wallet (DM only).\n"
             "`/status` - Check your current connection status.\n"
-            "`/portfolio` - View your account portfolio (requires connection).\n"
-            # Add more commands as they are implemented
-            "`/help` - Show this help message.\n\n"
+            "`/portfolio` - View your account portfolio (requires connection).\n\n"
+            "**Trading Controls:**\n"
+            "`/trading_status` - Check auto-trading status.\n"
+            "`/start_trading` - Enable all auto-trading components.\n"
+            "`/stop_trading` - Disable all auto-trading components.\n\n"
+            "**Advanced Controls:**\n"
+            "`/start_market_monitoring` - Start market data monitoring.\n"
+            "`/stop_market_monitoring` - Stop market data monitoring.\n"
+            "`/start_vault_tracking` - Start vault performance tracking.\n"
+            "`/stop_vault_tracking` - Stop vault performance tracking.\n"
+            "`/start_profit_optimization` - Start profit optimization strategies.\n"
+            "`/stop_profit_optimization` - Stop profit optimization strategies.\n\n"
             "**Security Note:** Always send `/connect` with your private key in a direct message to the bot. "
             "The bot will delete your message containing the key for security."
         )
         await update.message.reply_text(help_text, parse_mode='Markdown')
-
+        
+    async def trading_status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show current auto-trading status"""
+        if not self.trading_engine:
+            await update.message.reply_text("❌ Trading engine not initialized")
+            return
+            
+        # Get bot instance from parent class
+        bot = getattr(self.trading_engine, 'bot', None)
+        if not bot:
+            await update.message.reply_text("❌ Unable to access bot control system")
+            return
+            
+        status_text = (
+            "🤖 **Auto-Trading Status**\n\n"
+            f"**Global Auto-Trading:** {'✅ Enabled' if bot.auto_trading_enabled else '❌ Disabled'}\n\n"
+            f"**Market Monitoring:** {'✅ Running' if bot.market_monitoring_enabled else '❌ Stopped'}\n"
+            f"**Vault Tracking:** {'✅ Running' if bot.vault_tracking_enabled else '❌ Stopped'}\n"
+            f"**Profit Optimization:** {'✅ Running' if bot.profit_optimization_enabled else '❌ Stopped'}\n\n"
+            "Use `/start_trading` or `/stop_trading` to control all components."
+        )
+        
+        await update.message.reply_text(status_text, parse_mode='Markdown')
+    
+    async def start_trading_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Enable all auto-trading components"""
+        if not self.trading_engine:
+            await update.message.reply_text("❌ Trading engine not initialized")
+            return
+            
+        # Get bot instance from parent class
+        bot = getattr(self.trading_engine, 'bot', None)
+        if not bot:
+            await update.message.reply_text("❌ Unable to access bot control system")
+            return
+            
+        if bot.auto_trading_enabled:
+            await update.message.reply_text("ℹ️ Auto-trading is already enabled")
+            return
+            
+        result = await bot.toggle_auto_trading(True)
+        await update.message.reply_text(f"✅ {result['message']}")
+    
+    async def stop_trading_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Disable all auto-trading components"""
+        if not self.trading_engine:
+            await update.message.reply_text("❌ Trading engine not initialized")
+            return
+            
+        # Get bot instance from parent class
+        bot = getattr(self.trading_engine, 'bot', None)
+        if not bot:
+            await update.message.reply_text("❌ Unable to access bot control system")
+            return
+            
+        if not bot.auto_trading_enabled:
+            await update.message.reply_text("ℹ️ Auto-trading is already disabled")
+            return
+            
+        result = await bot.toggle_auto_trading(False)
+        await update.message.reply_text(f"✅ {result['message']}")
+    
+    # Add individual component control commands
+    async def start_market_monitoring_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start market monitoring"""
+        if not self.trading_engine or not hasattr(self.trading_engine, 'bot'):
+            await update.message.reply_text("❌ Trading engine not initialized")
+            return
+        
+        bot = self.trading_engine.bot
+        if bot.market_monitoring_enabled:
+            await update.message.reply_text("ℹ️ Market monitoring is already running")
+            return
+        
+        await bot._start_market_monitoring()
+        await update.message.reply_text("✅ Market monitoring started")
+    
+    async def stop_market_monitoring_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Stop market monitoring"""
+        if not self.trading_engine or not hasattr(self.trading_engine, 'bot'):
+            await update.message.reply_text("❌ Trading engine not initialized")
+            return
+        
+        bot = self.trading_engine.bot
+        if not bot.market_monitoring_enabled:
+            await update.message.reply_text("ℹ️ Market monitoring is already stopped")
+            return
+        
+        bot.market_monitoring_enabled = False
+        await update.message.reply_text("✅ Market monitoring will stop after current cycle")
+    
+    # Similar commands for vault_tracking and profit_optimization
+    async def start_vault_tracking_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start vault tracking"""
+        if not self.trading_engine or not hasattr(self.trading_engine, 'bot'):
+            await update.message.reply_text("❌ Trading engine not initialized")
+            return
+        
+        bot = self.trading_engine.bot
+        if bot.vault_tracking_enabled:
+            await update.message.reply_text("ℹ️ Vault tracking is already running")
+            return
+        
+        await bot._start_vault_tracking()
+        await update.message.reply_text("✅ Vault tracking started")
+    
+    async def stop_vault_tracking_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Stop vault tracking"""
+        if not self.trading_engine or not hasattr(self.trading_engine, 'bot'):
+            await update.message.reply_text("❌ Trading engine not initialized")
+            return
+        
+        bot = self.trading_engine.bot
+        if not bot.vault_tracking_enabled:
+            await update.message.reply_text("ℹ️ Vault tracking is already stopped")
+            return
+        
+        bot.vault_tracking_enabled = False
+        await update.message.reply_text("✅ Vault tracking will stop after current cycle")
+    
+    async def start_profit_optimization_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start profit optimization"""
+        if not self.trading_engine or not hasattr(self.trading_engine, 'bot'):
+            await update.message.reply_text("❌ Trading engine not initialized")
+            return
+        
+        bot = self.trading_engine.bot
+        if bot.profit_optimization_enabled:
+            await update.message.reply_text("ℹ️ Profit optimization is already running")
+            return
+        
+        await bot._start_profit_optimization()
+        await update.message.reply_text("✅ Profit optimization started")
+    
+    async def stop_profit_optimization_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Stop profit optimization"""
+        if not self.trading_engine or not hasattr(self.trading_engine, 'bot'):
+            await update.message.reply_text("❌ Trading engine not initialized")
+            return
+        
+        bot = self.trading_engine.bot
+        if not bot.profit_optimization_enabled:
+            await update.message.reply_text("ℹ️ Profit optimization is already stopped")
+            return
+        
+        bot.profit_optimization_enabled = False
+        await update.message.reply_text("✅ Profit optimization will stop after current cycle")
+    
     async def portfolio_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         is_valid, error_message = self.auth_handler.validate_session(user_id)
@@ -166,20 +334,50 @@ class TelegramTradingBot:
 
 
     async def handle_callbacks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle callback queries from inline keyboards"""
         query = update.callback_query
-        user_id = query.from_user.id # Get user_id from query
+        user_id = query.from_user.id
         data = query.data
 
-        # Route callbacks to TelegramAuthHandler methods
-        if data == f"create_agent_session_{user_id}":
-            await self.auth_handler.handle_create_agent_session_callback(update, context)
-        elif data == f"direct_key_session_{user_id}":
+        logger.info(f"Received callback: {data} from user {user_id}")
+
+        # Route callbacks to appropriate handlers
+        if data.startswith(f"create_agent_session_{user_id}"):
+            await self.auth_handler.create_agent_wallet_for_user(update, context)
+        elif data.startswith(f"direct_key_session_{user_id}"):
             await self.auth_handler.handle_direct_key_session_callback(update, context)
+        # Handle the simple callback format (without user_id suffix)
+        elif data == "create_agent":
+            await self.auth_handler.create_agent_wallet_for_user(update, context)
+        elif data == "view_portfolio":
+            await self.handle_portfolio_callback(update, context)
+        elif data.startswith("view_portfolio_"):
+            # Extract user_id from the callback data if present
+            try:
+                # The format is view_portfolio_USER_ID
+                callback_user_id = int(data.split('_')[-1])
+                if callback_user_id == user_id:  # Only allow if IDs match
+                    await self.handle_portfolio_callback(update, context)
+                else:
+                    await query.answer("Unauthorized action")
+            except (ValueError, IndexError):
+                await self.handle_portfolio_callback(update, context)
         else:
             # Handle other callbacks or acknowledge if not recognized
-            await query.answer("Callback received.") 
-            logger.info(f"Received unhandled callback: {data} from user {user_id}")
-            # await query.edit_message_text(f"Received: {data}") # Example response
+            await query.answer("Callback received.")
+            logger.info(f"Unhandled callback: {data} from user {user_id}")
+
+    async def handle_portfolio_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle portfolio view callback"""
+        query = update.callback_query
+        await query.answer("Loading portfolio...")
+        
+        try:
+            # Call the portfolio command handler to show portfolio
+            await self.portfolio_command(update, context)
+        except Exception as e:
+            logger.error(f"Error in portfolio callback: {e}", exc_info=True)
+            await query.message.reply_text(f"❌ Error displaying portfolio: {str(e)}")
 
     async def run(self):
         logger.info("Telegram bot polling started...")

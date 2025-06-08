@@ -1,4 +1,5 @@
 import asyncio
+from asyncio.log import logger
 import json
 import time
 import logging
@@ -58,177 +59,203 @@ class VaultManager:
     Uses real examples: basic_vault.py, basic_vault_transfer.py, and basic_transfer.py
     """
     
-    def __init__(self, vault_address: str, master_account=None, base_url=None, exchange=None, info=None):
+    def __init__(self, vault_address=None, base_url=None, exchange=None, info=None):
         self.vault_address = vault_address
-        self.logger = logging.getLogger(__name__)
+        self.base_url = base_url
+        self.exchange = exchange
+        self.info = info
+        self.initialized = False
         
-        # Use injected components if available, otherwise set up from scratch
-        if info and exchange:
-            self.info = info
-            self.exchange = exchange
-            self.address = getattr(exchange, 'account_address', None)
-        else:
-            # Use example_utils.setup pattern like all Hyperliquid examples
-            self.address, self.info, self.exchange = example_utils.setup(
-                base_url=base_url or constants.TESTNET_API_URL,
-                skip_ws=True
-            )
+        # Validate whether this vault manager can operate
+        self.operational = bool(self.vault_address and self.exchange and self.info)
         
-        # Create Exchange instance for vault operations using basic_vault.py pattern
-        if exchange:
-            self.vault_exchange = Exchange(
-                exchange.wallet, 
-                exchange.base_url, 
-                vault_address=vault_address
-            )
-        else:
-            self.vault_exchange = Exchange(
-                self.exchange.wallet, 
-                self.exchange.base_url, 
-                vault_address=vault_address
-            )
+        if not self.vault_address:
+            logger.warning("No vault address provided - vault manager will operate in limited mode")
         
-        self.vault_users = {}
-        self.profit_history = []
-        
-        # Enhanced performance tracking
-        self.historical_values = deque(maxlen=90)  # 90 days of historical values
-        self.daily_returns = deque(maxlen=90)      # 90 days of returns
-        self.performance_metrics = {}
-        self.performance_history = []
-        self.benchmark_comparisons = []
-        self.last_metrics_update = 0
-        self.real_time_monitor = None
-        
-        # Initialize database for user tracking
-        self._init_database()
-        
-        # Start enhanced performance tracking
-        asyncio.create_task(self._start_performance_tracking())
-        
-        self.logger.info(f"VaultManager initialized for vault: {vault_address}")
+        if not self.exchange or not self.info:
+            logger.warning("Missing exchange or info client - vault manager will operate in limited mode")
     
-    def _init_database(self):
-        """Initialize SQLite database for user tracking"""
-        self.conn = sqlite3.connect('vault_users.db')
-        cursor = self.conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vault_users (
-                user_id TEXT PRIMARY KEY,
-                deposit_amount REAL,
-                deposit_time REAL,
-                initial_vault_value REAL,
-                profit_share_rate REAL,
-                total_profits_earned REAL DEFAULT 0
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS profit_distributions (
-                distribution_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT,
-                amount REAL,
-                vault_performance REAL,
-                timestamp REAL,
-                weighted_factor REAL DEFAULT 1.0,
-                FOREIGN KEY (user_id) REFERENCES vault_users (user_id)
-            )
-        ''')
-        
-        # Enhanced performance tracking tables
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vault_performance_daily (
-                date TEXT PRIMARY KEY,
-                tvl REAL,
-                daily_return REAL,
-                total_return REAL,
-                maker_rebate REAL,
-                taker_fee REAL,
-                active_positions INTEGER,
-                user_count INTEGER,
-                best_asset TEXT,
-                worst_asset TEXT,
-                timestamp REAL
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vault_benchmark_comparison (
-                date TEXT PRIMARY KEY,
-                vault_return REAL,
-                btc_return REAL,
-                eth_return REAL,
-                sp500_return REAL,
-                alpha REAL,
-                beta REAL,
-                timestamp REAL
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vault_drawdowns (
-                drawdown_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_date TEXT,
-                end_date TEXT,
-                depth REAL,
-                duration_days INTEGER,
-                recovery_date TEXT,
-                timestamp REAL
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS vault_real_time_metrics (
-                metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                metric_name TEXT,
-                metric_value REAL,
-                updated_at REAL
-            )
-        ''')
-        
-        self.conn.commit()
+    def check_health(self) -> bool:
+        """Check if vault manager is operational"""
+        return self.operational and self.initialized
+    
+    def validate_vault_address(self) -> bool:
+        """
+        Validate vault address format and existence
+        Returns True if valid, False otherwise
+        """
+        if not self.vault_address:
+            logger.warning("No vault address configured")
+            return False
+            
+        # Check if the address is properly formatted (starts with 0x and 42 chars)
+        if not self.vault_address.startswith('0x') or len(self.vault_address) != 42:
+            logger.warning(f"Invalid vault address format: {self.vault_address}")
+            return False
+            
+        # Ensure it's a string to avoid serialization issues
+        if not isinstance(self.vault_address, str):
+            logger.warning(f"Vault address must be a string, got {type(self.vault_address)}")
+            return False
+            
+        return True
+    
+    def ensure_vault_address_format(self) -> str:
+        """
+        Ensure vault address has proper format for API calls
+        Returns properly formatted vault address or empty string if invalid
+        """
+        if not self.vault_address:
+            return ""
+            
+        # Ensure address starts with 0x prefix
+        address = self.vault_address
+        if not address.startswith('0x'):
+            address = f'0x{address}'
+            
+        return address
 
+    async def initialize(self):
+        """Initialize the vault manager with validation"""
+        if not self.operational:
+            logger.warning("Cannot initialize vault manager: missing required components")
+            self.initialized = False
+            return False
+            
+        # Validate vault address
+        if not self.validate_vault_address():
+            logger.error("Invalid vault address - cannot initialize")
+            self.initialized = False
+            return False
+            
+        try:
+            # Test connection to vault
+            formatted_address = self.ensure_vault_address_format()
+            state = self.info.user_state(formatted_address)
+            if state and "marginSummary" in state:
+                self.initialized = True
+                logger.info(f"Vault manager initialized for {formatted_address}")
+                return True
+            else:
+                logger.error(f"Failed to fetch vault state for {formatted_address}")
+                self.initialized = False
+                return False
+        except Exception as e:
+            logger.error(f"Error initializing vault manager: {e}")
+            self.initialized = False
+            return False
+    
     async def get_vault_balance(self) -> Dict:
         """Get real vault balance using Info API exactly like basic_vault.py"""
-        try:
-            # Use same pattern as basic_vault.py for getting vault state
-            vault_state = self.info.user_state(self.vault_address)
-            margin_summary = vault_state.get('marginSummary', {})
+        # Return graceful response if vault is not operational
+        if not self.operational or not self.initialized:
+            return {
+                "status": "not_configured",
+                "total_value": 0.0,
+                "message": "Vault not configured (missing address or API clients)",
+                "position_count": 0,
+                "positions": [],
+                "total_margin_used": 0.0,
+                "total_unrealized_pnl": 0.0
+            }
             
-            # Get positions data exactly like the examples
+        # Validate vault address
+        if not self.validate_vault_address():
+            return {
+                "status": "error",
+                "message": "Invalid vault address",
+                "total_value": 0.0,
+                "position_count": 0,
+                "positions": [],
+                "total_margin_used": 0.0,
+                "total_unrealized_pnl": 0.0
+            }
+            
+        try:
+            # Format address properly to avoid API errors
+            formatted_address = self.ensure_vault_address_format()
+            
+            # Fetch vault account data
+            vault_state = self.info.user_state(formatted_address)
+            
+            # Extract account value and other key metrics
+            margin_summary = vault_state.get("marginSummary", {})
+            account_value = float(margin_summary.get("accountValue", 0))
+            total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
+            total_unrealized_pnl = float(margin_summary.get("totalUnrealizedPnl", 0))
+            
+            # Get positions
             positions = []
-            for asset_position in vault_state.get('assetPositions', []):
-                position = asset_position['position']
-                if float(position['szi']) != 0:  # Only non-zero positions
-                    positions.append({
-                        'coin': position['coin'],
-                        'size': float(position['szi']),
-                        'entry_px': float(position['entryPx']) if position['entryPx'] else 0,
-                        'unrealized_pnl': float(position['unrealizedPnl']),
-                        'margin_used': float(position['marginUsed'])
-                    })
+            asset_positions = vault_state.get("assetPositions", [])
+            position_count = len(asset_positions)
+            
+            for asset_position in asset_positions:
+                position = asset_position.get("position", {})
+                if position:
+                    coin = position.get("coin", "Unknown")
+                    size = float(position.get("szi", 0))
+                    entry_price = float(position.get("entryPx", 0))
+                    unrealized_pnl = float(position.get("unrealizedPnl", 0))
+                    
+                    if abs(size) > 1e-10:  # Only include non-zero positions
+                        positions.append({
+                            "coin": coin,
+                            "size": size,
+                            "entry_price": entry_price,
+                            "unrealized_pnl": unrealized_pnl,
+                            "notional_value": abs(size) * entry_price
+                        })
             
             return {
-                'status': 'success',
-                'total_value': float(margin_summary.get('accountValue', 0)),
-                'total_margin_used': float(margin_summary.get('totalMarginUsed', 0)),
-                'total_unrealized_pnl': float(margin_summary.get('totalUnrealizedPnl', 0)),
-                'cross_maintenance_margin': float(vault_state.get('crossMaintenanceMarginUsed', 0)),
-                'positions': positions,
-                'position_count': len(positions)
+                "status": "success",
+                "total_value": account_value,
+                "position_count": position_count,
+                "positions": positions,
+                "total_margin_used": total_margin_used,
+                "total_unrealized_pnl": total_unrealized_pnl
             }
             
         except Exception as e:
-            self.logger.error(f"Error getting vault balance: {e}")
-            return {'status': 'error', 'message': str(e)}
+            logger.error(f"Error getting vault balance: {e}")
+            return {
+                "status": "error",
+                "message": str(e),
+                "total_value": 0.0,
+                "position_count": 0,
+                "positions": [],
+                "total_margin_used": 0.0,
+                "total_unrealized_pnl": 0.0
+            }
 
     async def deposit_to_vault(self, amount: float) -> Dict:
         """
         Deposit to vault using basic_vault_transfer.py pattern exactly
         """
+        # Skip if vault not configured or initialized
+        if not self.operational or not self.initialized:
+            return {
+                'status': 'error',
+                'message': 'Vault not configured or initialized'
+            }
+            
+        # Validate vault address
+        if not self.validate_vault_address():
+            return {
+                'status': 'error',
+                'message': 'Invalid vault address'
+            }
+            
         try:
             # Check if we have sufficient balance first
+            if not hasattr(self, 'address') or not self.address:
+                if hasattr(self.exchange, 'account_address'):
+                    self.address = self.exchange.account_address
+                else:
+                    return {
+                        'status': 'error',
+                        'message': 'No source address configured'
+                    }
+
             user_state = self.info.user_state(self.address)
             account_value = float(user_state['marginSummary']['accountValue'])
             
@@ -238,55 +265,94 @@ class VaultManager:
                     'message': f'Insufficient balance. Available: ${account_value:.2f}'
                 }
             
+            # Format vault address properly
+            formatted_address = self.ensure_vault_address_format()
+            
             # Use basic_vault_transfer.py exact pattern
             # Transfer amount USD to vault (amount in micro USDC)
             amount_micro = int(amount * 1_000_000)
             
             transfer_result = self.exchange.vault_usd_transfer(
-                self.vault_address, True, amount_micro
+                formatted_address, True, amount_micro
             )
-            print(transfer_result)  # Print like the example
             
             return {
                 'status': 'success' if transfer_result.get('status') == 'ok' else 'error',
                 'result': transfer_result,
                 'amount': amount,
-                'vault_address': self.vault_address
+                'vault_address': formatted_address
             }
             
         except Exception as e:
-            self.logger.error(f"Error depositing to vault: {e}")
+            logger.error(f"Error depositing to vault: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def withdraw_from_vault(self, amount: float) -> Dict:
         """
         Withdraw from vault using basic_vault_transfer.py pattern exactly
         """
+        # Skip if vault not configured or initialized
+        if not self.operational or not self.initialized:
+            return {
+                'status': 'error',
+                'message': 'Vault not configured or initialized'
+            }
+            
+        # Validate vault address
+        if not self.validate_vault_address():
+            return {
+                'status': 'error',
+                'message': 'Invalid vault address'
+            }
+            
         try:
+            # Check if vault has sufficient balance first
+            formatted_address = self.ensure_vault_address_format()
+            vault_balance = await self.get_vault_balance()
+            
+            if vault_balance['status'] != 'success' or vault_balance['total_value'] < amount:
+                return {
+                    'status': 'error',
+                    'message': f"Insufficient vault balance. Available: ${vault_balance.get('total_value', 0):.2f}"
+                }
+            
             # Use basic_vault_transfer.py pattern but with is_deposit=False
             amount_micro = int(amount * 1_000_000)
             
             transfer_result = self.exchange.vault_usd_transfer(
-                self.vault_address, False, amount_micro
+                formatted_address, False, amount_micro
             )
-            print(transfer_result)  # Print like the example
             
             return {
                 'status': 'success' if transfer_result.get('status') == 'ok' else 'error',
                 'result': transfer_result,
                 'amount': amount,
-                'vault_address': self.vault_address
+                'vault_address': formatted_address
             }
             
         except Exception as e:
-            self.logger.error(f"Error withdrawing from vault: {e}")
+            logger.error(f"Error withdrawing from vault: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def transfer_usd_to_user(self, user_address: str, amount: float) -> Dict:
         """
         Transfer USD to user using basic_transfer.py pattern exactly
         """
+        # Skip if not operational
+        if not self.operational:
+            return {
+                'status': 'error',
+                'message': 'Vault manager not operational'
+            }
+            
         try:
+            # Validate user address
+            if not user_address or not isinstance(user_address, str) or len(user_address) != 42 or not user_address.startswith('0x'):
+                return {
+                    'status': 'error',
+                    'message': f'Invalid user address: {user_address}'
+                }
+            
             # Check if account can perform internal transfers (from basic_transfer.py)
             if self.exchange.account_address != self.exchange.wallet.address:
                 return {
@@ -295,8 +361,14 @@ class VaultManager:
                 }
             
             # Use basic_transfer.py exact pattern
+            # Amount should be a valid number
+            if not isinstance(amount, (int, float)) or amount <= 0:
+                return {
+                    'status': 'error',
+                    'message': f'Invalid amount: {amount}'
+                }
+                
             transfer_result = self.exchange.usd_transfer(amount, user_address)
-            print(transfer_result)  # Print like the example
             
             return {
                 'status': 'success' if transfer_result.get('status') == 'ok' else 'error',
@@ -306,7 +378,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error transferring USD: {e}")
+            logger.error(f"Error transferring USD: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def place_vault_order(self, coin: str, is_buy: bool, size: float, price: float) -> Dict:
@@ -321,7 +393,7 @@ class VaultManager:
             )
             print(order_result)  # Print like the example
             
-            self.logger.info(f"Vault order placed: {coin} {size}@{price}")
+            logger.info(f"Vault order placed: {coin} {size}@{price}")
             return {
                 'status': 'success' if order_result.get('status') == 'ok' else 'error',
                 'result': order_result,
@@ -329,7 +401,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error placing vault order: {e}")
+            logger.error(f"Error placing vault order: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def cancel_vault_order(self, coin: str, oid: int) -> Dict:
@@ -341,14 +413,14 @@ class VaultManager:
             cancel_result = self.vault_exchange.cancel(coin, oid)
             print(cancel_result)  # Print like the example
             
-            self.logger.info(f"Vault order cancelled: {coin} oid:{oid}")
+            logger.info(f"Vault order cancelled: {coin} oid:{oid}")
             return {
                 'status': 'success' if cancel_result.get('status') == 'ok' else 'error',
                 'result': cancel_result
             }
             
         except Exception as e:
-            self.logger.error(f"Error cancelling vault order: {e}")
+            logger.error(f"Error cancelling vault order: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def execute_basic_vault_example(self) -> Dict:
@@ -366,7 +438,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error executing basic vault example: {e}")
+            logger.error(f"Error executing basic vault example: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def execute_basic_vault_transfer_example(self, amount: float = 5.0) -> Dict:
@@ -384,7 +456,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error executing vault transfer example: {e}")
+            logger.error(f"Error executing vault transfer example: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def execute_basic_transfer_example(self, recipient: str, amount: float = 1.0) -> Dict:
@@ -402,7 +474,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error executing transfer example: {e}")
+            logger.error(f"Error executing transfer example: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def distribute_profits(self, profit_share: float = 0.1) -> Dict:
@@ -455,7 +527,7 @@ class VaultManager:
                 }
                 
         except Exception as e:
-            self.logger.error(f"Error distributing profits: {e}")
+            logger.error(f"Error distributing profits: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def create_user_vault(
@@ -953,7 +1025,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error in loyalty distribution: {e}")
+            logger.error(f"Error in loyalty distribution: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def _start_performance_tracking(self):
@@ -964,7 +1036,7 @@ class VaultManager:
             
             # Start background monitoring
             self.real_time_monitor = asyncio.create_task(self._run_real_time_monitoring())
-            self.logger.info("Started vault performance tracking and monitoring")
+            logger.info("Started vault performance tracking and monitoring")
             
             # Schedule regular updates
             while True:
@@ -988,9 +1060,9 @@ class VaultManager:
                 await asyncio.sleep(21600)
                 
         except asyncio.CancelledError:
-            self.logger.info("Performance tracking stopped")
+            logger.info("Performance tracking stopped")
         except Exception as e:
-            self.logger.error(f"Error in performance tracking: {e}")
+            logger.error(f"Error in performance tracking: {e}")
 
     async def _run_real_time_monitoring(self):
         """Run real-time monitoring of vault performance"""
@@ -1022,7 +1094,7 @@ class VaultManager:
                     
                     # Check for critical alerts
                     if metrics['margin_utilization'] > 0.8:
-                        self.logger.warning(f"HIGH MARGIN UTILIZATION: {metrics['margin_utilization']:.1%}")
+                        logger.warning(f"HIGH MARGIN UTILIZATION: {metrics['margin_utilization']:.1%}")
                     
                     self.conn.commit()
                 
@@ -1030,9 +1102,9 @@ class VaultManager:
                 await asyncio.sleep(300)
                 
         except asyncio.CancelledError:
-            self.logger.info("Real-time monitoring stopped")
+            logger.info("Real-time monitoring stopped")
         except Exception as e:
-            self.logger.error(f"Error in real-time monitoring: {e}")
+            logger.error(f"Error in real-time monitoring: {e}")
 
     async def _calculate_performance_metrics(self) -> Dict:
         """Calculate comprehensive performance metrics"""
@@ -1201,7 +1273,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error calculating performance metrics: {e}")
+            logger.error(f"Error calculating performance metrics: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def _update_benchmark_comparison(self) -> Dict:
@@ -1279,7 +1351,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error updating benchmark comparison: {e}")
+            logger.error(f"Error updating benchmark comparison: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def _calculate_max_drawdown(self) -> float:
@@ -1303,7 +1375,7 @@ class VaultManager:
             return max_drawdown
             
         except Exception as e:
-            self.logger.error(f"Error calculating max drawdown: {e}")
+            logger.error(f"Error calculating max drawdown: {e}")
             return 0.0
 
     async def _detect_drawdowns(self) -> Dict:
@@ -1371,7 +1443,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error detecting drawdowns: {e}")
+            logger.error(f"Error detecting drawdowns: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def _update_performance_metrics(self, new_metrics: Dict):
@@ -1397,7 +1469,7 @@ class VaultManager:
                 self.performance_history.pop(0)
                 
         except Exception as e:
-            self.logger.error(f"Error updating performance metrics: {e}")
+            logger.error(f"Error updating performance metrics: {e}")
 
     async def _get_current_vault_value(self) -> float:
         """Get current vault value"""
@@ -1458,7 +1530,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error getting enhanced performance analytics: {e}")
+            logger.error(f"Error getting enhanced performance analytics: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def _analyze_positions_by_coin(self) -> Dict:
@@ -1519,7 +1591,7 @@ class VaultManager:
             return {'coins': sorted_coins}
             
         except Exception as e:
-            self.logger.error(f"Error analyzing positions by coin: {e}")
+            logger.error(f"Error analyzing positions by coin: {e}")
             return {'coins': [], 'error': str(e)}
 
     async def get_performance_benchmarks(self) -> Dict:
@@ -1577,7 +1649,7 @@ class VaultManager:
             return {'status': 'success', 'benchmarks': [], 'message': 'No benchmark data available'}
             
         except Exception as e:
-            self.logger.error(f"Error getting performance benchmarks: {e}")
+            logger.error(f"Error getting performance benchmarks: {e}")
             return {'status': 'error', 'message': str(e)}
 
     async def get_profit_attribution_analysis(self) -> Dict:
@@ -1653,7 +1725,7 @@ class VaultManager:
             }
             
         except Exception as e:
-            self.logger.error(f"Error getting profit attribution: {e}")
+            logger.error(f"Error getting profit attribution: {e}")
             return {'status': 'error', 'message': str(e)}
 
 # Legacy alias for backward compatibility

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Main entry point for the Hyperliquid Alpha Trading Bot
 Unified architecture connecting all components with real implementations
@@ -103,7 +104,14 @@ class HyperliquidAlphaBot:
         self.info = None
         self.exchange = None
         
-        logger.info("HyperliquidAlphaBot initialized")
+        # Auto-trading control flags - DISABLED by default
+        self.auto_trading_enabled = False  # Override config, force disabled on startup
+        self.market_monitoring_enabled = False
+        self.vault_tracking_enabled = False
+        self.profit_optimization_enabled = False
+        self.trading_enabled = False  # Master switch for all trading activities
+        
+        logger.info("HyperliquidAlphaBot initialized with trading DISABLED")
     
     def _load_config(self, config_path: str) -> dict:
         """Load and validate configuration"""
@@ -115,8 +123,21 @@ class HyperliquidAlphaBot:
             hl_config = config.setdefault('hyperliquid', {})
             hl_config.setdefault('api_url', constants.TESTNET_API_URL)
             hl_config.setdefault('mainnet', hl_config['api_url'] == constants.MAINNET_API_URL)
-            hl_config.setdefault('use_agent_for_core_operations', False) # New option
+            hl_config.setdefault('use_agent_for_core_operations', False)
 
+            # Add auto_trading section with defaults - Always set enabled_on_startup to False
+            config.setdefault('auto_trading', {
+                'enabled_on_startup': False,  # Force disabled
+                'market_monitoring': False,   # Disable monitoring by default
+                'vault_tracking': False,      # Disable vault tracking by default
+                'profit_optimization': False, # Disable profit optimization by default
+                'require_manual_start': True  # Always require manual start
+            })
+            
+            # Force these values regardless of what's in the config
+            config['auto_trading']['enabled_on_startup'] = False
+            config['auto_trading']['require_manual_start'] = True
+            
             config.setdefault('vault', {
                 'address': '',
                 'minimum_deposit': 50,
@@ -246,7 +267,10 @@ class HyperliquidAlphaBot:
                     info=self.info
                 )
                 
-                # Test vault manager
+                # Initialize the vault manager properly
+                await self.vault_manager.initialize()
+                
+                # Only attempt to test balance if a vault address is configured
                 if self.config['vault']['address']:
                     vault_balance = await self.vault_manager.get_vault_balance()
                     if vault_balance['status'] == 'success':
@@ -254,8 +278,8 @@ class HyperliquidAlphaBot:
                     else:
                         logger.warning("⚠️ Vault manager created but balance check failed")
                 else:
-                    logger.info("✅ Vault manager initialized (no vault address configured)")
-                    
+                    logger.info("✅ Vault manager initialized in limited mode (no vault address configured)")
+                
             except Exception as e:
                 logger.error(f"Vault manager initialization failed: {e}")
                 self.vault_manager = self._create_fallback_vault_manager()
@@ -428,12 +452,13 @@ class HyperliquidAlphaBot:
             except:
                 pass
         
-        # Check vault manager
+        # Check vault manager - properly handle missing vault configuration
         if self.vault_manager:
             try:
-                balance = await self.vault_manager.get_vault_balance()
-                health_status['vault_manager'] = balance['status'] != 'error'
-            except:
+                # Use the check_health method instead of checking balance
+                health_status['vault_manager'] = self.vault_manager.check_health()
+            except Exception as e:
+                logger.error(f"Error checking vault manager health: {e}")
                 pass
         
         # Count working strategies
@@ -451,6 +476,14 @@ class HyperliquidAlphaBot:
         
         logger.info(f"🏥 Health check: {healthy_components}/{total_components} components healthy")
         
+        # Include more detailed output about which components failed
+        failed_components = [k for k, v in health_status.items() 
+                            if (isinstance(v, bool) and not v) or 
+                               (isinstance(v, int) and v == 0)]
+        
+        if failed_components:
+            logger.warning(f"⚠️ Unhealthy components: {', '.join(failed_components)}")
+        
         if healthy_components < total_components * 0.7:  # Less than 70% healthy
             logger.warning("⚠️ System health below optimal - some features may be limited")
         
@@ -459,49 +492,81 @@ class HyperliquidAlphaBot:
     async def start_background_tasks(self):
         """Start background monitoring and trading tasks"""
         try:
-            logger.info("⚡ Starting background tasks...")
+            logger.info("⚡ Initializing background tasks...")
             
-            # Start WebSocket monitoring
+            # Initialize WebSocket monitoring but don't start any trading components
             if self.ws_manager:
-                asyncio.create_task(self._monitor_markets())
-                logger.info("📊 Market monitoring started")
+                # Only enable basic system health monitoring, no trading
+                await self._start_basic_monitoring()
+                logger.info("📊 Only basic system monitoring enabled - trading disabled")
             
-            # Start vault performance tracking
+            # Initialize but DO NOT start vault performance tracking
             if self.vault_manager:
-                asyncio.create_task(self._track_vault_performance())
-                logger.info("🏦 Vault performance tracking started")
+                logger.info("🏦 Vault performance tracking initialized but DISABLED")
+                self.vault_tracking_enabled = False
             
-            # Start strategy execution
+            # DO NOT start any strategy execution
             for name, strategy in self.strategies.items():
                 if hasattr(strategy, 'run_background'):
-                    asyncio.create_task(strategy.run_background())
-                    logger.info(f"🎯 {name} strategy background task started")
+                    logger.info(f"🎯 {name} strategy loaded but DISABLED - requires manual activation")
             
-            # Start profit optimization
-            asyncio.create_task(self._run_profit_optimization())
-            logger.info("💰 Profit optimization started")
+            # DO NOT start profit optimization
+            logger.info("💰 Profit optimization DISABLED - requires manual activation")
+            self.profit_optimization_enabled = False
             
-            logger.info("✅ All background tasks started")
+            logger.info("✅ System monitoring initialized, ALL TRADING DISABLED")
+            logger.info("🤖 Trading is DISABLED - use Telegram commands to start trading when ready")
             
         except Exception as e:
-            logger.error(f"Error starting background tasks: {e}")
+            logger.error(f"Error initializing background tasks: {e}")
     
-    async def _monitor_markets(self):
-        """Monitor real-time market data"""
+    async def _start_basic_monitoring(self):
+        """Start only the basic system monitoring (no trading)"""
+        asyncio.create_task(self._monitor_system_health())
+        logger.info("🏥 Basic system health monitoring started")
+    
+    async def _monitor_system_health(self):
+        """Monitor only basic system health - no trading activities"""
         while self.running:
             try:
+                # Simple connection check
+                if self.info and self.address:
+                    try:
+                        # Just check if we can connect - don't subscribe to trading data
+                        user_state = self.info.user_state(self.address)
+                        account_value = float(user_state.get('marginSummary', {}).get('accountValue', 0))
+                        logger.info(f"System health: Connection OK, Account value: ${account_value:,.2f}")
+                    except Exception as e:
+                        logger.warning(f"Connection check failed: {e}")
+                
+                await asyncio.sleep(300)  # Check every 5 minutes
+                
+            except Exception as e:
+                logger.error(f"Error in system health monitoring: {e}")
+                await asyncio.sleep(60)
+    
+    async def _monitor_markets(self):
+        """Monitor real-time market data - MODIFIED to prevent auto-trading"""
+        while self.running and self.market_monitoring_enabled:
+            try:
+                # Only run this if explicitly enabled via command
+                if not self.trading_enabled:
+                    logger.info("Market monitoring running but trading is disabled")
+                    await asyncio.sleep(60)
+                    continue
+                
                 # Subscribe to key market data
                 major_coins = ['BTC', 'ETH', 'SOL', 'ARB']
                 
                 for coin in major_coins:
-                    # Subscribe to order book for spread analysis
-                    self.ws_manager.subscribe_l2_book(coin, self._process_market_data)
+                    # Subscribe to order book for spread analysis - properly await the coroutine
+                    await self.ws_manager.subscribe_l2_book(coin, self._process_market_data)
                     
-                    # Subscribe to BBO for tight spread detection
-                    self.ws_manager.subscribe_bbo(coin, self._detect_opportunities)
+                    # Subscribe to BBO for tight spread detection - properly await the coroutine
+                    await self.ws_manager.subscribe_bbo(coin, self._detect_opportunities)
                 
-                # Subscribe to all mids for general monitoring
-                self.ws_manager.subscribe_all_mids(self._track_price_movements)
+                # Subscribe to all mids for general monitoring - properly await the coroutine
+                await self.ws_manager.subscribe_all_mids(self._track_price_movements)
                 
                 await asyncio.sleep(300)  # Refresh subscriptions every 5 minutes
                 
@@ -510,26 +575,23 @@ class HyperliquidAlphaBot:
                 await asyncio.sleep(60)
     
     async def _track_vault_performance(self):
-        """Track and optimize vault performance"""
-        while self.running:
+        """Track vault performance but DO NOT execute trades"""
+        while self.running and self.vault_tracking_enabled:
             try:
-                # Get current vault balance
+                # Only run this if explicitly enabled via command
+                if not self.trading_enabled:
+                    logger.info("Vault tracking running but trading is disabled")
+                    await asyncio.sleep(60)
+                    continue
+                
+                # Get current vault balance - monitoring only
                 vault_balance = await self.vault_manager.get_vault_balance()
                 
                 if vault_balance['status'] == 'success':
                     logger.info(f"Vault balance: ${vault_balance['total_value']:,.2f}")
                     
-                    # Calculate performance metrics
-                    if vault_balance['total_value'] > 1000:  # Only trade if sufficient capital
-                        # Execute profit strategies
-                        for strategy_name, strategy in self.strategies.items():
-                            try:
-                                if hasattr(strategy, 'execute_strategy'):
-                                    result = await strategy.execute_strategy()
-                                    if result.get('status') == 'success':
-                                        logger.info(f"{strategy_name} strategy executed successfully")
-                            except Exception as e:
-                                logger.error(f"Error executing {strategy_name}: {e}")
+                    # DO NOT execute trading strategies - only monitor
+                    logger.info("Vault tracking active but trading execution disabled")
                 
                 await asyncio.sleep(300)  # Check every 5 minutes
                 
@@ -538,22 +600,28 @@ class HyperliquidAlphaBot:
                 await asyncio.sleep(60)
     
     async def _run_profit_optimization(self):
-        """Run profit optimization strategies"""
-        while self.running:
+        """Run profit optimization logic but DO NOT execute trades"""
+        while self.running and self.profit_optimization_enabled:
             try:
-                # Execute profit bot strategies
+                # Only run this if explicitly enabled via command
+                if not self.trading_enabled:
+                    logger.info("Profit optimization running but trading is disabled")
+                    await asyncio.sleep(60)
+                    continue
+                
+                # Get profit opportunities but DO NOT execute them
                 if 'profit' in self.strategies:
                     profit_bot = self.strategies['profit']
                     
-                    # Execute maker rebate strategy
-                    rebate_result = await profit_bot.multi_pair_rebate_mining(['BTC', 'ETH', 'SOL'])
-                    if rebate_result['status'] == 'success':
-                        logger.info(f"Rebate mining: {rebate_result['total_orders_placed']} orders placed")
+                    # Scan for rebate mining opportunities but don't execute
+                    logger.info("Scanning for rebate mining opportunities (execution disabled)")
+                    # Comment out actual execution
+                    # rebate_result = await profit_bot.multi_pair_rebate_mining(['BTC', 'ETH', 'SOL'])
                     
-                    # Execute vault performance strategy
-                    vault_result = await profit_bot.vault_performance_strategy()
-                    if vault_result['status'] == 'success':
-                        logger.info(f"Vault strategy performance fee: ${vault_result['performance_fee_earned']:.4f}")
+                    # Analyze vault performance but don't execute strategy
+                    logger.info("Analyzing vault performance (execution disabled)")
+                    # Comment out actual execution
+                    # vault_result = await profit_bot.vault_performance_strategy()
                 
                 await asyncio.sleep(600)  # Every 10 minutes
                 
@@ -561,71 +629,38 @@ class HyperliquidAlphaBot:
                 logger.error(f"Error in profit optimization: {e}")
                 await asyncio.sleep(120)
     
-    def _process_market_data(self, data):
-        """Process market data for trading signals"""
-        try:
-            # Extract market data and check for opportunities
-            coin = data.get('coin', '')
-            if coin and 'levels' in data:
-                # Check for imbalance opportunities
-                levels = data['levels']
-                if len(levels) >= 2:
-                    bids = levels[0]
-                    asks = levels[1]
-                    
-                    if bids and asks:
-                        bid_depth = sum(float(lvl[1]) for lvl in bids[:5])  # Top 5 levels
-                        ask_depth = sum(float(lvl[1]) for lvl in asks[:5])
-                        
-                        if bid_depth + ask_depth > 0:
-                            imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth)
-                            
-                            # Log significant imbalances
-                            if abs(imbalance) > 0.3:
-                                logger.info(f"{coin} order book imbalance: {imbalance:.3f}")
+    async def toggle_auto_trading(self, enabled: bool) -> Dict:
+        """Enable or disable auto-trading globally"""
+        previous_state = self.trading_enabled
+        self.trading_enabled = enabled
         
-        except Exception as e:
-            logger.error(f"Error processing market data: {e}")
+        if enabled and not previous_state:
+            # Log that trading is enabled but require explicit start of components
+            logger.info("🚀 Trading ENABLED - but individual components need manual activation")
+            return {
+                "status": "success", 
+                "message": "Trading enabled, but individual components need manual activation. Use specific commands to start each component."
+            }
+            
+        elif not enabled and previous_state:
+            # Update the flag to prevent new auto-trading activity
+            logger.info("🛑 Trading DISABLED - all trading operations will be blocked")
+            return {"status": "success", "message": "Trading disabled, all trading operations blocked"}
+        else:
+            # No change in state
+            state_str = "enabled" if enabled else "disabled"
+            return {"status": "info", "message": f"Trading already {state_str}"}
     
-    def _detect_opportunities(self, data):
-        """Detect trading opportunities from BBO data"""
-        try:
-            coin = data.get('coin', '')
-            if coin and 'bid' in data and 'ask' in data:
-                bid = float(data['bid'])
-                ask = float(data['ask'])
-                mid = (bid + ask) / 2
-                spread_bps = ((ask - bid) / mid) * 10000
-                
-                # Log tight spreads for market making
-                if spread_bps < 5:  # Less than 0.5 bps
-                    logger.info(f"{coin} tight spread opportunity: {spread_bps:.1f}bps")
-        
-        except Exception as e:
-            logger.error(f"Error detecting opportunities: {e}")
-    
-    def _track_price_movements(self, data):
-        """Track price movements for momentum signals"""
-        try:
-            if isinstance(data, dict) and 'mids' in data:
-                # Log significant price movements
-                for coin, price_str in data['mids'].items():
-                    if coin in ['BTC', 'ETH', 'SOL']:  # Focus on major coins
-                        price = float(price_str)
-                        # Could add momentum tracking logic here
-        
-        except Exception as e:
-            logger.error(f"Error tracking price movements: {e}")
-    
+    # Update the startup message to indicate trading is disabled
     async def start(self):
         """Start the unified bot system"""
         try:
-            logger.info("🚀 Starting Hyperliquid Alpha Trading Bot...")
+            logger.info("🚀 Starting Hyperliquid Alpha Trading Bot (TRADING DISABLED)...")
             
             # Initialize all components
             await self.initialize_components()
             
-            # Start background tasks
+            # Start background tasks (only monitoring, no trading)
             self.running = True
             await self.start_background_tasks()
             
@@ -706,6 +741,13 @@ def create_default_config():
             "allowed_users": [],
             "admin_users": []
         },
+        "auto_trading": {
+            "enabled_on_startup": False,
+            "market_monitoring": True,
+            "vault_tracking": True,
+            "profit_optimization": True,
+            "require_manual_start": True
+        },
         "strategies": {
             "grid_trading": {
                 "enabled": True,
@@ -735,12 +777,9 @@ def create_default_config():
 
 async def main():
     """Main entry point with comprehensive error handling"""
-    bot_instance = None # Define bot_instance outside try block for finally
+    bot_instance = None
     try:
         # --- Hyperliquid Authentication Guidance (for example_utils.py) ---
-        # This part is for the bot's own core operations if it uses example_utils.setup()
-        # The new example_utils.setup handles agent vs direct key logic internally
-        # It will prioritize agent_config.json if available.
         examples_config_path = Path(__file__).parent / 'examples' / 'config.json'
         private_key_env = os.environ.get('HYPERLIQUID_PRIVATE_KEY')
 
@@ -750,13 +789,17 @@ async def main():
             logger.error(f"  nor is '{examples_config_path}' (with a 'secret_key') found.")
             logger.error(f"  Please configure one of these for the bot's main wallet.")
             logger.error(f"  See documentation for HYPERLIQUID_PRIVATE_KEY or format of '{examples_config_path}'.")
-            # Optionally, create a template examples/config.json to guide the user
+            
+            # Create template examples/config.json
             if not examples_config_path.parent.exists():
                 examples_config_path.parent.mkdir(parents=True, exist_ok=True)
             if not examples_config_path.exists():
                 try:
                     with open(examples_config_path, "w") as f:
-                        json.dump({"secret_key": "0xYourEthereumPrivateKeyHere", "account_address": "YourOptionalAccountAddressHere"}, f, indent=2)
+                        json.dump({
+                            "secret_key": "0xYourEthereumPrivateKeyHere", 
+                            "account_address": "YourOptionalAccountAddressHere"
+                        }, f, indent=2)
                     logger.info(f"Created a template '{examples_config_path}'. Please edit it with your details.")
                 except Exception as e_cfg:
                     logger.error(f"Could not create template examples/config.json: {e_cfg}")
@@ -766,14 +809,12 @@ async def main():
         elif examples_config_path.exists():
             logger.info(f"Found '{examples_config_path}'. It will be used by example_utils.setup() if HYPERLIQUID_PRIVATE_KEY is not set.")
 
-
         # --- Bot Configuration Setup (root config.json) ---
         bot_config_path = Path("config.json")
         if not bot_config_path.exists():
             logger.info("📝 Bot's root config.json not found. Creating default configuration...")
-            create_default_config() # This creates the bot's own config.json in the root directory
+            create_default_config()
             logger.info(f"ℹ️ Please review and update '{bot_config_path}' with your Telegram token, etc.")
-            # No need to return here if examples/config.json or env var handles auth
 
         # Load and validate bot's root config
         with open(bot_config_path, 'r') as f:
@@ -786,30 +827,28 @@ async def main():
         
         # Create and start the bot
         bot_instance = HyperliquidAlphaBot()
+        await bot_instance.start()
         
-        try:
-            await bot_instance.start()
-        except KeyboardInterrupt:
-            logger.info("Received shutdown signal...")
+    except KeyboardInterrupt:
+        logger.info("Received shutdown signal...")
+        if bot_instance:
             await bot_instance.stop()
-        
     except Exception as e:
-        logger.error(f"💥 Fatal error: {e}")
+        logger.critical(f"💥 Unhandled critical error in main: {e}", exc_info=True)
+        if bot_instance:
+            await bot_instance.stop()
         raise
     finally:
-        if bot_instance and bot_instance.running: # If bot was started and is running
+        if bot_instance and bot_instance.running:
             logger.info("Initiating graceful shutdown from finally block...")
             await bot_instance.stop()
-        logger.info("👋 Application has exited.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        # This is caught by main's finally block now if bot started
         logger.info("👋 Main process terminated by KeyboardInterrupt.")
     except Exception as e:
-        # This will catch errors during asyncio.run(main()) itself or if main() raises before bot starts
-        logger.critical(f"💥 Unhandled critical error in __main__: {e}", exc_info=True)
-        sys.exit(1) # Exit with error code
+        logger.critical(f"💥 Fatal error in main execution: {e}", exc_info=True)
+        sys.exit(1)
 

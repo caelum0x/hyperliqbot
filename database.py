@@ -222,6 +222,14 @@ class Database:
         
         self.connection.commit()
     
+    async def initialize(self):
+        """Initialize async components of the database"""
+        # This method is called by main.py and expected to be async
+        # Perform any async initialization tasks here
+        # Since most of our initialization is done in _init_database, 
+        # this can be a simple pass-through method for compatibility
+        return True
+    
     async def add_user(self, telegram_id: int, wallet_address: str = None, referrer_id: int = None):
         """Add new user to database"""
         async with self.lock:

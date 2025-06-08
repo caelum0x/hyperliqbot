@@ -33,6 +33,20 @@ sys.path.append(examples_dir)
 import basic_sub_account
 import example_utils
 
+import logging
+from datetime import datetime
+from typing import Dict, Optional, Set
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+class OnboardingState(Enum):
+    NEW = "new"
+    WALLET_CREATED = "wallet_created"
+    FUNDED = "funded"
+    STRATEGY_SELECTED = "strategy_selected"
+    TRADING_ACTIVE = "trading_active"
+    COMPLETED = "completed"
 
 class UserSession:
     def __init__(self, user_id: int, private_key: str, account_address: str = ""):

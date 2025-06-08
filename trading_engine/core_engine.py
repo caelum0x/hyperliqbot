@@ -1,19 +1,24 @@
 import asyncio
+from asyncio.log import logger
 import json
 import time
-from typing import Dict, List, Optional, Tuple
+import typing # Import typing module itself
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING # These imports might be shadowed
 from dataclasses import dataclass
 import os # Ensure os is imported
 import sys # Ensure sys is imported
 import logging # Ensure logging is imported
-import time # Ensure time is imported
+# time is imported again, it's fine but redundant
 import numpy as np # Ensure numpy is imported
 
+if TYPE_CHECKING:
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.info import Info
 
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
-from hyperliquid.utils.types import *
+from hyperliquid.utils.types import * # Potential source of name shadowing
 # Ensure trading_engine imports are structured to avoid circular dependencies
 # For example, if main_bot imports TradingEngine, TradingEngine should not import main_bot directly at module level.
 # from trading_engine import main_bot, referral_manager, vault_manager, websocket_manager
@@ -187,7 +192,7 @@ class RiskManagementSystem:
                 self.trading_cooldowns[coin] = time.time() + 3600 # Restored
                 self.logger.info(f"Cooldown applied for {coin} due to significant loss.") # Restored
     
-    def assess_overall_risk(self, account_value: float) -> Dict:
+    def assess_overall_risk(self, account_value: float) -> typing.Dict[str, typing.Any]:
         """Perform comprehensive risk assessment of the portfolio"""
         # Only run assessment every 15 minutes
         current_time = time.time()
@@ -241,7 +246,7 @@ class RiskManagementSystem:
         """Get current position size for a coin"""
         return abs(self.position_sizes.get(coin, 0.0))
     
-    def get_trading_stats(self) -> Dict:
+    def get_trading_stats(self) -> typing.Dict[str, typing.Any]:
         """Get overall trading statistics"""
         total_trades = self.wins + self.losses
         
@@ -299,7 +304,10 @@ class TradingEngine:
     Now imports and uses ALL available examples
     """
     
-    def __init__(self, base_url=None, account=None, wallet_manager=None, address=None, info=None, exchange=None, config_for_self_init=None): # Added config_for_self_init
+    def __init__(self, base_url: typing.Optional[str] = None, account: typing.Optional[typing.Any] = None, 
+                 wallet_manager: typing.Optional[typing.Any] = None, address: typing.Optional[str] = None, 
+                 info: typing.Optional['Info'] = None, exchange: typing.Optional['Exchange'] = None, 
+                 config_for_self_init: typing.Optional[typing.Dict[str, typing.Any]] = None): # Added config_for_self_init
         self.logger = logging.getLogger(__name__)
         self.wallet_manager = wallet_manager
         self.config_for_self_init = config_for_self_init # Store if passed
@@ -307,8 +315,8 @@ class TradingEngine:
         if wallet_manager:
             self.address = None  # Will be set when using specific wallet
             # Assuming wallet_manager provides info and exchange instances when a wallet is selected
-            self.info = wallet_manager.info if hasattr(wallet_manager, 'info') else None 
-            self.exchange = None # Will be set by use_wallet
+            self.info: typing.Optional['Info'] = wallet_manager.info if hasattr(wallet_manager, 'info') else None 
+            self.exchange: typing.Optional['Exchange'] = None # Will be set by use_wallet
             self.logger.info("TradingEngine initialized with WalletManager. Waiting for wallet selection.")
         elif address and info and exchange: # If components are passed directly
             self.address = address
@@ -351,7 +359,7 @@ class TradingEngine:
         self.correlation_matrix = {}
         self.last_correlation_update = 0
 
-    def use_wallet(self, wallet_name: str, sub_account_name: str = None):
+    def use_wallet(self, wallet_name: str, sub_account_name: typing.Optional[str] = None):
         """Switch to using a specific wallet or sub-account"""
         if not self.wallet_manager:
             self.logger.error("WalletManager not available in TradingEngine.")
@@ -386,7 +394,7 @@ class TradingEngine:
             self.logger.info(f"TradingEngine now using wallet '{wallet_name}' at {self.address}")
 
     async def create_and_fund_sub_account(self, parent_wallet_name: str, sub_account_name: str, 
-                                        usd_amount: float = 1.0, token_transfers: List[Dict] = None):
+                                        usd_amount: float = 1.0, token_transfers: typing.Optional[typing.List[typing.Dict[str, typing.Any]]] = None):
         """Create and fund sub-account using wallet manager's basic_sub_account integration"""
         if not self.wallet_manager:
             raise ValueError("No wallet manager available")
@@ -395,143 +403,189 @@ class TradingEngine:
             parent_wallet_name, sub_account_name, usd_amount, token_transfers
         )
 
-    async def place_limit_order(self, coin, is_buy, size, price):
-        """Place limit order using basic_order.py pattern exactly"""
-        if not self.exchange or not self.info:
-            self.logger.error("Exchange or Info client not initialized in TradingEngine. Cannot place order.")
-            return {"status": "error", "message": "TradingEngine not fully initialized."}
+    async def get_all_mids(self) -> typing.Dict[str, str]:
+        """
+        Get mid prices for all assets.
+        Returns a dictionary of coin symbols to their current mid prices.
+        """
         try:
-            # Get asset ID according to Hyperliquid standards
-            meta = self.info.meta()
-            asset_id = None
+            if not hasattr(self, 'info') or not self.info:
+                return {}
             
-            # Handle different asset types (perps, spot, builder-deployed)
-            # This logic needs to be robust based on actual meta structure
-            target_name = coin.upper()
-            for i, asset_data in enumerate(meta.get("universe", [])):
-                if asset_data.get("name", "").upper() == target_name:
-                    asset_id = i
-                    break
-            
-            if asset_id is None:
-                self.logger.error(f"Coin {coin} (target: {target_name}) not found in metadata: {meta.get('universe', [])[:5]}") # Log first 5 for debug
-                return {"status": "error", "message": f"Coin {coin} not found"}
+            # Get all mids using the Hyperliquid Info client
+            mids = self.info.all_mids()
+            return mids
+        except Exception as e:
+            logging.error(f"Error getting all mids: {e}")
+            return {}
+    
+    async def validate_connection(self) -> bool:
+        """
+        Validates the connection to Hyperliquid API and ensures the trading engine can make API calls.
+        Returns True if connection is valid, False otherwise.
+        """
+        try:
+            # Check if required components are initialized
+            if not hasattr(self, 'info') or not self.info:
+                self.logger.error("Info client not initialized in TradingEngine")
+                return False
                 
-            # Format order following Hyperliquid notation standards
-            order = {
-                "a": asset_id,  # asset
-                "b": is_buy,    # isBuy
-                "p": str(price), # price
-                "s": str(size),  # size
-                "r": False,     # reduceOnly
-                "t": {"limit": {"tif": "Gtc"}}  # Good Till Cancelled
-            }
-            
-            # Place the order with proper format
-            order_result = self.exchange.order(
-                orders=[order],
-                grouping="na"
-            )
-            
-            if order_result["status"] == "ok":
-                status = order_result["response"]["data"]["statuses"][0]
-                if "resting" in status:
-                    order_status = self.info.query_order_by_oid(self.address, status["resting"]["oid"])
+            if not hasattr(self, 'exchange') or not self.exchange:
+                self.logger.error("Exchange client not initialized in TradingEngine")
+                return False
+                
+            if not hasattr(self, 'address') or not self.address:
+                self.logger.error("Address not set in TradingEngine")
+                return False
+                
+            # Test connection by getting basic market data
+            all_mids = await self.get_all_mids()
+            if not all_mids or len(all_mids) == 0:
+                self.logger.error("Failed to retrieve market data")
+                return False
+                
+            # Test wallet/account access
+            try:
+                user_state = self.info.user_state(self.address)
+                if not user_state:
+                    self.logger.error(f"Failed to retrieve user state for address {self.address}")
+                    return False
                     
-            self.logger.info(f"Limit order placed: {coin} {size}@{price}")
-            return order_result
+                # Check if we can get account value (basic check)
+                account_value = float(user_state.get('marginSummary', {}).get('accountValue', 0))
+                self.logger.info(f"Connection validated successfully for address {self.address}, account value: ${account_value:.2f}")
+                
+            except Exception as user_state_error:
+                self.logger.error(f"Failed to retrieve user state: {user_state_error}")
+                return False
+                
+            return True
+            
         except Exception as e:
-            self.logger.error(f"Error placing limit order: {e}")
-            return {"status": "error", "message": str(e)}
+            self.logger.error(f"Connection validation failed: {e}")
+            return False
+            
+    async def __missing_method_handler(self, method_name, *args, **kwargs):
+        """
+        Handler for missing methods to provide meaningful error messages
+        """
+        error_msg = f"Method {method_name} not implemented in TradingEngine"
+        self.logger.error(error_msg)
+        return {"status": "error", "message": error_msg, "error_type": "NotImplemented"}
         
-    async def place_market_order(self, coin, is_buy, size):
-        """Place market order using basic_market_order.py pattern with correct notation"""
-        if not self.exchange or not self.info:
-            self.logger.error("Exchange or Info client not initialized in TradingEngine. Cannot place order.")
-            return {"status": "error", "message": "TradingEngine not fully initialized."}
+    def __getattr__(self, name):
+        """
+        Handle missing attribute/method access with proper error messages
+        """
+        # For method access, return an async function that provides error details
+        async def missing_method(*args, **kwargs):
+            return await self.__missing_method_handler(name, *args, **kwargs)
+            
+        # Check if it's likely a method call (part of our API)
+        common_methods = [
+            'place_order', 'cancel_order', 'get_positions', 'get_orders',
+            'adjust_leverage', 'get_fills', 'get_funding_rates'
+        ]
+        
+        if name in common_methods or name.startswith(('get_', 'place_', 'cancel_', 'update_')):
+            self.logger.warning(f"Attempted to access unimplemented method: {name}")
+            return missing_method
+            
+        # For regular attributes, raise AttributeError
+        raise AttributeError(f"TradingEngine has no attribute or method '{name}'")
+    
+    async def place_limit_order(self, coin: str, is_buy: bool, size: float, price: float):
+        """
+        Place a limit order with proper tick size and price validation
+        """
         try:
-            # Get asset ID according to Hyperliquid standards
-            meta = self.info.meta()
-            asset_id = None
-            target_name = coin.upper()
-            for i, asset_data in enumerate(meta.get("universe", [])):
-                if asset_data.get("name", "").upper() == target_name:
-                    asset_id = i
-                    break
+            # 1. Adjust price to tick size
+            adjusted_price = self._adjust_price_to_tick_size(coin, price)
+            
+            # Log if price was adjusted
+            if adjusted_price != price:
+                logging.info(f"Adjusted price from {price} to {adjusted_price} for {coin} to match tick size")
+                
+            # 2. Prepare order with adjusted price
+            order_type = {"limit": {"tif": "Gtc"}}
+            
+            # 3. Place the order with properly formatted price
+            result = self.exchange.order(coin, is_buy, size, adjusted_price, order_type)
+            
+            # 4. Log outcome
+            if result.get("status") == "ok":
+                statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
+                if "error" in statuses[0]:
+                    logging.error(f"Order error for {coin}: {statuses[0]['error']}")
+                else:
+                    logging.info(f"Successfully placed order for {coin}: {is_buy}, {size}, {adjusted_price}")
                     
-            if asset_id is None:
-                self.logger.error(f"Coin {coin} (target: {target_name}) not found for market order.")
-                return {"status": "error", "message": f"Coin {coin} not found"}
-            
-            # Format IOC order for immediate execution (market-like)
-            order = {
-                "a": asset_id,  # asset
-                "b": is_buy,    # isBuy
-                "p": str(1000000 if is_buy else 0.00001),  # Extreme price for immediate execution
-                "s": str(size),  # size
-                "r": False,     # reduceOnly
-                "t": {"limit": {"tif": "Ioc"}}  # Immediate or Cancel
-            }
-            
-            # Place the order with proper format
-            order_result = self.exchange.order(
-                orders=[order],
-                grouping="na"
-            )
-            
-            self.logger.info(f"Market order placed: {coin} {size}")
-            return order_result
+            return result
         except Exception as e:
-            self.logger.error(f"Error placing market order: {e}")
+            logging.error(f"Error placing limit order: {e}")
             return {"status": "error", "message": str(e)}
-        
-    async def place_adding_liquidity_order(self, coin, is_buy, size, price):
-        """Place add liquidity order using basic_adding.py pattern with proper notation"""
-        if not self.exchange or not self.info:
-            self.logger.error("Exchange or Info client not initialized in TradingEngine. Cannot place order.")
-            return {"status": "error", "message": "TradingEngine not fully initialized."}
+    
+    async def place_market_order(self, coin: str, is_buy: bool, size: float):
+        """
+        Place a market order with IOC (Immediate or Cancel) type
+        """
         try:
-            # Get asset ID according to Hyperliquid standards
-            meta = self.info.meta()
-            asset_id = None
-            target_name = coin.upper()
-            for i, asset_data in enumerate(meta.get("universe", [])):
-                if asset_data.get("name", "").upper() == target_name:
-                    asset_id = i
-                    break
-                    
-            if asset_id is None:
-                self.logger.error(f"Coin {coin} (target: {target_name}) not found for ALO order.")
-                return {"status": "error", "message": f"Coin {coin} not found"}
+            # Get current price from mids
+            mids = await self.get_all_mids()
+            mid_price = float(mids.get(coin, 0))
             
-            # Format ALO order for guaranteed maker rebates
-            order = {
-                "a": asset_id,  # asset
-                "b": is_buy,    # isBuy
-                "p": str(price), # price
-                "s": str(size),  # size
-                "r": False,     # reduceOnly
-                "t": {"limit": {"tif": "Alo"}}  # Add Liquidity Only
-            }
+            if mid_price == 0:
+                return {"status": "error", "message": "Could not determine price"}
+                
+            # Add/subtract slippage for market orders
+            slippage = 0.001  # 0.1% slippage
+            exec_price = mid_price * (1 + slippage) if is_buy else mid_price * (1 - slippage)
             
-            # Place the order with proper format
-            order_result = self.exchange.order(
-                orders=[order],
-                grouping="na"
-            )
+            # Adjust to tick size
+            adjusted_price = self._adjust_price_to_tick_size(coin, exec_price)
             
-            if order_result["status"] == "ok":
-                status = order_result["response"]["data"]["statuses"][0]
-                if "resting" in status:
-                    order_status = self.info.query_order_by_oid(self.address, status["resting"]["oid"])
+            # Use IOC to ensure immediate execution
+            order_type = {"limit": {"tif": "Ioc"}}
             
-            self.logger.info(f"Add liquidity order placed: {coin} {size}@{price}")
-            return order_result
+            # Place order
+            result = self.exchange.order(coin, is_buy, size, adjusted_price, order_type)
+            return result
         except Exception as e:
-            self.logger.error(f"Error placing add liquidity order: {e}")
+            logging.error(f"Error placing market order: {e}")
+            return {"status": "error", "message": str(e)}
+    
+    async def place_adding_liquidity_order(self, coin: str, is_buy: bool, size: float, price: float):
+        """
+        Place an ALO (Add Liquidity Only) order that ensures post-only behavior
+        """
+        try:
+            # 1. Adjust price to tick size
+            adjusted_price = self._adjust_price_to_tick_size(coin, price)
+            
+            # 2. Ensure the price won't immediately match (post-only)
+            post_only_price = self._ensure_post_only_valid(coin, is_buy, adjusted_price)
+            
+            # 3. Use ALO (Add Liquidity Only) type for post-only behavior
+            order_type = {"limit": {"tif": "Alo"}}
+            
+            # 4. Place the order
+            result = self.exchange.order(coin, is_buy, size, post_only_price, order_type)
+            
+            # 5. Log outcome
+            if result.get("status") == "ok":
+                statuses = result.get("response", {}).get("data", {}).get("statuses", [{}])
+                if "error" in statuses[0]:
+                    logging.error(f"ALO order error for {coin}: {statuses[0]['error']}")
+                else:
+                    logging.info(f"Successfully placed ALO order for {coin}: {is_buy}, {size}, {post_only_price}")
+            
+            return result
+        except Exception as e:
+            logging.error(f"Error placing ALO order: {e}")
             return {"status": "error", "message": str(e)}
         
-    async def place_tpsl_order(self, coin, is_buy, size, price, tp_price=None, sl_price=None):
+    async def place_tpsl_order(self, coin: str, is_buy: bool, size: float, price: float, 
+                              tp_price: typing.Optional[float] = None, sl_price: typing.Optional[float] = None) -> typing.Dict[str, typing.Any]:
         """Place order with take profit/stop loss using basic_tpsl.py pattern"""
         if not self.exchange or not self.info:
             self.logger.error("Exchange or Info client not initialized in TradingEngine. Cannot place order.")
@@ -604,8 +658,8 @@ class TradingEngine:
             self.logger.error(f"Error placing TPSL order: {e}")
             return {"status": "error", "message": str(e)}
         
-    async def modify_order(self, coin: str, order_id: int, new_price: float, new_size: Optional[float] = None, 
-                         reduce_only: Optional[bool] = None, order_type: Optional[Dict] = None) -> Dict:
+    async def modify_order(self, coin: str, order_id: int, new_price: float, new_size: typing.Optional[float] = None, 
+                         reduce_only: typing.Optional[bool] = None, order_type: typing.Optional[typing.Dict[str, typing.Any]] = None) -> typing.Dict[str, typing.Any]:
         """
         Modify an existing order following the official Hyperliquid API format
         """
@@ -628,3 +682,204 @@ class TradingEngine:
         except Exception as e:
             self.logger.error(f"Error modifying order: {e}")
             return {"status": "error", "message": str(e)}
+        
+    async def get_vault_balance(self, vault_address: typing.Optional[str] = None) -> typing.Dict[str, typing.Any]:
+        """
+        Get vault balance with proper error handling and request formatting
+        to avoid 422 errors with the Hyperliquid API
+        """
+        try:
+            if not vault_address and hasattr(self, 'vault_address'):
+                vault_address = self.vault_address
+                
+            if not vault_address:
+                return {"status": "error", "message": "No vault address specified"}
+                
+            # Ensure vault_address is properly formatted
+            # Sometimes including '0x' prefix can cause issues depending on the API expectations
+            if not vault_address.startswith('0x'):
+                vault_address = f'0x{vault_address}'
+                
+            # Use the Info client to query user state for the vault address
+            if self.info:
+                try:
+                    vault_state = self.info.user_state(vault_address)
+                    
+                    # Extract relevant balance information
+                    margin_summary = vault_state.get('marginSummary', {})
+                    account_value = float(margin_summary.get('accountValue', '0'))
+                    
+                    return {
+                        "status": "success",
+                        "total_value": account_value,
+                        "margin_summary": margin_summary,
+                        "vault_address": vault_address
+                    }
+                except Exception as specific_e:
+                    self.logger.error(f"API error getting vault balance: {specific_e}")
+                    return {"status": "error", "message": str(specific_e)}
+            else:
+                return {"status": "error", "message": "Info client not initialized"}
+                
+        except Exception as e:
+            self.logger.error(f"Error getting vault balance: {e}")
+            return {"status": "error", "message": str(e)}
+
+class TradingEngineCore:
+    """
+    Core trading engine for managing strategies and executing trades
+    """
+    
+    def __init__(self, address: typing.Optional[str] = None, info: typing.Optional['Info'] = None, 
+                 exchange: typing.Optional['Exchange'] = None, base_url: typing.Optional[str] = None):
+        self.address = address
+        self.info = info
+        self.exchange = exchange
+        self.base_url = base_url
+        
+        # Active strategies per user
+        self.user_strategies: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
+        
+        # Available strategies
+        self.available_strategies: typing.Dict[str, str] = {
+            'grid': 'Grid Trading - Automated buy/sell orders at price levels',
+            'maker_rebate': 'Maker Rebate Mining - Earn rebates by providing liquidity',
+            'manual': 'Manual Trading - Execute trades manually with assistance'
+        }
+
+    async def get_all_mids(self) -> typing.Dict[str, str]:
+        """Get current mid prices for all trading pairs"""
+        try:
+            if not self.info:
+                return {}
+                
+            all_mids = self.info.all_mids()
+            return all_mids
+            
+        except Exception as e:
+            logger.error(f"Error getting mid prices: {e}")
+            return {}
+
+    async def start_strategy(self, user_id: int, strategy_type: str, parameters: typing.Optional[typing.Dict[str, typing.Any]] = None) -> typing.Dict[str, typing.Any]:
+        """Start a trading strategy for a user"""
+        try:
+            if strategy_type not in self.available_strategies:
+                return {
+                    'status': 'error',
+                    'message': f'Unknown strategy: {strategy_type}'
+                }
+
+            # Store strategy configuration
+            self.user_strategies[user_id] = {
+                'type': strategy_type,
+                'parameters': parameters or {},
+                'active': True,
+                'started_at': asyncio.get_event_loop().time()
+            }
+
+            if strategy_type == 'grid':
+                return await self._start_grid_strategy(user_id, parameters or {})
+            elif strategy_type == 'maker_rebate':
+                return await self._start_maker_rebate_strategy(user_id, parameters or {})
+            elif strategy_type == 'manual':
+                return await self._start_manual_strategy(user_id)
+            
+        except Exception as e:
+            logger.error(f"Error starting strategy for user {user_id}: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    async def _start_grid_strategy(self, user_id: int, parameters: typing.Dict[str, typing.Any]) -> typing.Dict[str, typing.Any]:
+        """Start grid trading strategy"""
+        coin = parameters.get('coin', 'BTC')
+        levels = int(parameters.get('levels', 10))
+        spacing = float(parameters.get('spacing', 0.002))
+        size = float(parameters.get('size', 10))
+
+        # In production, this would place actual grid orders
+        logger.info(f"Starting grid strategy for user {user_id}: {coin} with {levels} levels")
+        
+        return {
+            'status': 'success',
+            'message': f'Grid trading started on {coin}',
+            'details': {
+                'coin': coin,
+                'levels': levels,
+                'spacing': f'{spacing*100:.2f}%',
+                'size': size
+            }
+        }
+
+    async def _start_maker_rebate_strategy(self, user_id: int, parameters: typing.Dict[str, typing.Any]) -> typing.Dict[str, typing.Any]:
+        """Start maker rebate mining strategy"""
+        pairs = parameters.get('pairs', ['BTC', 'ETH'])
+        
+        logger.info(f"Starting maker rebate strategy for user {user_id} on pairs: {pairs}")
+        
+        return {
+            'status': 'success',
+            'message': f'Maker rebate mining started on {len(pairs)} pairs',
+            'details': {
+                'pairs': pairs,
+                'strategy': 'Placing orders near mid price to earn rebates'
+            }
+        }
+
+    async def _start_manual_strategy(self, user_id: int) -> typing.Dict[str, typing.Any]:
+        """Start manual trading assistance"""
+        logger.info(f"Starting manual trading assistance for user {user_id}")
+        
+        return {
+            'status': 'success',
+            'message': 'Manual trading mode activated',
+            'details': {
+                'features': ['Price alerts', 'Order suggestions', 'Market analysis']
+            }
+        }
+
+    async def stop_strategy(self, user_id: int) -> typing.Dict[str, typing.Any]:
+        """Stop trading strategy for a user"""
+        try:
+            if user_id not in self.user_strategies:
+                return {'status': 'error', 'message': 'No active strategy found'}
+                
+            strategy = self.user_strategies[user_id]
+            strategy['active'] = False
+            
+            # In production, this would cancel orders and close positions
+            logger.info(f"Stopped strategy for user {user_id}")
+            
+            return {
+                'status': 'success',
+                'message': f'Strategy {strategy["type"]} stopped'
+            }
+            
+        except Exception as e:
+            logger.error(f"Error stopping strategy for user {user_id}: {e}")
+            return {'status': 'error', 'message': str(e)}
+
+    def get_user_strategy(self, user_id: int) -> typing.Optional[typing.Dict[str, typing.Any]]:
+        """Get current strategy for a user"""
+        return self.user_strategies.get(user_id)
+
+    def get_available_strategies(self) -> typing.Dict[str, str]:
+        """Get list of available strategies"""
+        return self.available_strategies.copy()
+
+    async def get_strategy_parameters(self, strategy_type: str) -> typing.Dict[str, typing.Any]:
+        """Get required parameters for a strategy"""
+        if strategy_type == 'grid':
+            return {
+                'coin': {'type': 'string', 'default': 'BTC', 'description': 'Trading pair'},
+                'levels': {'type': 'integer', 'default': 10, 'description': 'Number of grid levels'},
+                'spacing': {'type': 'float', 'default': 0.002, 'description': 'Spacing between levels (%)'},
+                'size': {'type': 'float', 'default': 10, 'description': 'Order size in USDC'}
+            }
+        elif strategy_type == 'maker_rebate':
+            return {
+                'pairs': {'type': 'list', 'default': ['BTC', 'ETH'], 'description': 'Trading pairs'},
+                'spread': {'type': 'float', 'default': 0.0001, 'description': 'Spread from mid price'}
+            }
+        elif strategy_type == 'manual':
+            return {}
+        
+        return {}

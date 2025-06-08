@@ -25,6 +25,7 @@ class HyperliquidWebSocketManager:
         self.subscriptions = {}
         self.connected = False
         self.logger = logging.getLogger(__name__)
+        self.ws = None  # Initialize ws attribute to avoid AttributeError
         
         # Initialize post request tracking
         self.post_futures = {}
@@ -992,16 +993,14 @@ class HyperliquidWebSocketManager:
     async def test_connection(self) -> bool:
         """Test WebSocket connection"""
         try:
-            if self.ws and self.ws.open:
-                return True
+            if not self.connected or not self.ws:  # Check both connected flag and ws attribute
+                # Connect if not already connected
+                await self.connect()
                 
-            # Connect if not already connected
-            await self.connect()
-            
-            # Wait a bit to establish connection
-            await asyncio.sleep(2)
-            
-            return self.ws and self.ws.open
+                # Wait a bit to establish connection
+                await asyncio.sleep(2)
+                
+            return self.connected and self.ws and self.ws.open
         except Exception as e:
             self.logger.error(f"WebSocket connection test failed: {e}")
             return False
