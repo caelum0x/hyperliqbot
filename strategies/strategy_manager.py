@@ -506,3 +506,211 @@ class StrategyManager:
             }
             for name, strategy in self.strategies.items()
         }
+
+"""
+Strategy Manager for per-user strategy execution
+Handles isolation between users and strategy-specific execution logic
+"""
+import asyncio
+import logging
+import time
+from typing import Dict, List, Optional, Any
+from datetime import datetime
+
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+from hyperliquid.utils import constants
+
+logger = logging.getLogger(__name__)
+
+class PerUserStrategyManager:
+    """
+    Strategy Manager for per-user strategy execution aligned with Hyperliquid API
+    Handles isolation between users and strategy-specific execution logic
+    """
+    
+    def __init__(self):
+        self.base_url = constants.MAINNET_API_URL
+        self.user_strategies = {}
+        self.active_tasks = {}
+        self.user_manager = None
+        logger.info("PerUserStrategyManager initialized with Hyperliquid API alignment")
+    
+    def set_user_manager(self, user_manager):
+        """Set user manager for accessing user data"""
+        self.user_manager = user_manager
+    
+    async def execute_grid_trading(self, user_id: int, exchange: Exchange, config: Dict) -> Dict:
+        """
+        Execute grid trading strategy aligned with Hyperliquid API specifications
+        Uses proper asset IDs, tick sizes, and order types for maker rebates
+        """
+        try:
+            coin = config.get('coin', 'ETH')
+            grid_levels = config.get('levels', 5)
+            grid_spacing = config.get('spacing', 0.01)  # 1% spacing
+            position_size = config.get('position_size', 0.01)
+            
+            # Get market data using Info API
+            info = Info(self.base_url)
+            
+            # Get asset metadata for proper decimals and tick sizes
+            meta_response = info.meta()
+            universe = meta_response.get('universe', [])
+            
+            # Find asset index for the coin
+            asset_index = None
+            sz_decimals = 4  # Default
+            for i, asset in enumerate(universe):
+                if asset.get('name') == coin:
+                    asset_index = i
+                    sz_decimals = asset.get('szDecimals', 4)
+                    break
+            
+            if asset_index is None:
+                return {'status': 'error', 'message': f'Asset {coin} not found in universe'}
+            
+            # Get current market price
+            mids = info.all_mids()
+            if coin not in mids:
+                return {'status': 'error', 'message': f'No price data for {coin}'}
+            
+            current_price = float(mids[coin])
+            
+            # Get L2 book for better price placement
+            l2_book = info.l2_snapshot(coin)
+            
+            orders_placed = 0
+            
+            # Place grid orders with proper API format
+            for i in range(grid_levels):
+                # Buy orders below market
+                buy_price = current_price * (1 - grid_spacing * (i + 1))
+                buy_price = self._round_to_tick_size(buy_price, coin)
+                
+                # Format size according to szDecimals
+                formatted_size = round(position_size, sz_decimals)
+                
+                try:
+                    # Use Add Liquidity Only (Alo) for guaranteed maker rebates
+                    # Method 1: All positional parameters
+                    buy_order = exchange.order(
+                        coin,                           # coin
+                        True,                          # is_buy
+                        formatted_size,                # sz
+                        buy_price,                     # px
+                        {"limit": {"tif": "Alo"}}     # order_type
+                    )
+                    
+                    if buy_order.get('status') == 'ok':
+                        orders_placed += 1
+                        logger.info(f"Grid buy order placed: {coin} {formatted_size} @ {buy_price}")
+                        
+                except Exception as e:
+                    logger.error(f"Error placing grid buy order: {e}")
+                
+                # Sell orders above market
+                sell_price = current_price * (1 + grid_spacing * (i + 1))
+                sell_price = self._round_to_tick_size(sell_price, coin)
+                
+                try:
+                    # Method 1: All positional parameters
+                    sell_order = exchange.order(
+                        coin,                           # coin
+                        False,                         # is_buy
+                        formatted_size,                # sz
+                        sell_price,                    # px
+                        {"limit": {"tif": "Alo"}}     # order_type
+                    )
+                    
+                    if sell_order.get('status') == 'ok':
+                        orders_placed += 1
+                        logger.info(f"Grid sell order placed: {coin} {formatted_size} @ {sell_price}")
+                        
+                except Exception as e:
+                    logger.error(f"Error placing grid sell order: {e}")
+            
+            return {
+                'status': 'success',
+                'strategy': 'grid_trading',
+                'orders_placed': orders_placed,
+                'asset_index': asset_index,
+                'coin': coin
+            }
+            
+        except Exception as e:
+            logger.error(f"Error executing grid trading for user {user_id}: {e}")
+            return {'status': 'error', 'message': str(e)}
+    
+    def _round_to_tick_size(self, price: float, coin: str) -> float:
+        """
+        Round price to valid tick size according to Hyperliquid specs
+        Prices can have up to 5 significant figures, max 6 decimal places for perps
+        """
+        # Get significant figures count
+        price_str = f"{price:.10f}".rstrip('0').rstrip('.')
+        
+        # Handle integer prices (always allowed)
+        if '.' not in price_str:
+            return float(price_str)
+        
+        # For decimal prices, ensure max 5 significant figures
+        if len(price_str.replace('.', '')) > 5:
+            # Round to 5 significant figures
+            from decimal import Decimal, ROUND_HALF_UP
+            d = Decimal(str(price))
+            rounded = d.quantize(Decimal('0.00001'), rounding=ROUND_HALF_UP)
+            price = float(rounded)
+        
+        # Ensure max 6 decimal places for perps (as per API docs)
+        return round(price, 6)
+    
+    async def execute_profit_bot(self, user_id: int, exchange: Exchange, config: Dict) -> Dict:
+        """
+        Execute profit bot strategy focused on maker rebates and HLP integration
+        Aligned with Hyperliquid fee structure and vault system
+        """
+        try:
+            # Import the profit bot strategy
+            from strategies.hyperliquid_profit_bot import HyperliquidProfitBot
+            
+            # Create profit bot instance with user's exchange
+            profit_bot = HyperliquidProfitBot(
+                exchange=exchange,
+                info=Info(self.base_url),
+                base_url=self.base_url
+            )
+            
+            # Execute maker rebate strategy for maximum fee efficiency
+            coins = config.get('coins', ['BTC', 'ETH', 'SOL'])
+            total_orders = 0
+            total_rebate_potential = 0
+            
+            for coin in coins:
+                try:
+                    result = await profit_bot.maker_rebate_strategy(
+                        coin=coin,
+                        position_size=config.get('position_size', 0.01)
+                    )
+                    
+                    if result.get('status') == 'success':
+                        total_orders += result.get('orders_placed', 0)
+                        total_rebate_potential += result.get('expected_rebate_per_fill', 0)
+                        
+                except Exception as e:
+                    logger.error(f"Error in maker rebate for {coin}: {e}")
+            
+            # Execute multi-pair rebate mining for tier progression
+            rebate_result = await profit_bot.multi_pair_rebate_mining(coins)
+            
+            return {
+                'status': 'success',
+                'strategy': 'profit_bot',
+                'orders_placed': total_orders,
+                'rebate_potential': total_rebate_potential,
+                'multi_pair_result': rebate_result
+            }
+            
+        except Exception as e:
+            logger.error(f"Error executing profit bot for user {user_id}: {e}")
+            return {'status': 'error', 'message': str(e)}

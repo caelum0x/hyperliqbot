@@ -6,18 +6,27 @@ from typing import Dict, List, Optional, Any
 import logging
 import time
 import asyncio
+from eth_account import Account
+from eth_account.signers.local import LocalAccount
 
 class BaseTrader:
     """
     Base trader class that ProfitOptimizedTrader will inherit from
     Provides common functionality without circular imports
+    
+    Now enhanced with agent wallet support for secure trading
     """
     
-    def __init__(self, address=None, info=None, exchange=None):
-        self.address = address
+    def __init__(self, address=None, info=None, exchange=None, agent_wallet=None):
+        self.address = address  # Master account address for queries
         self.info = info
         self.exchange = exchange
+        self.agent_wallet = agent_wallet  # Agent wallet data for signing
         self.logger = logging.getLogger(__name__)
+        
+        # Nonce management for agent wallet transactions
+        self.last_used_nonce = 0
+        self.nonce_increment = 0
     
     async def get_all_mids(self) -> Dict[str, float]:
         """Get mid prices for all assets"""
@@ -33,32 +42,116 @@ class BaseTrader:
             return {}
     
     async def get_user_state(self) -> Dict:
-        """Get user state including balances and positions"""
+        """
+        Get user state including balances and positions
+        
+        Important: Always uses master address for queries, not agent address
+        """
         if not self.info or not self.address:
             return {}
         
         try:
+            # Always use master address for state queries, never agent address
             return self.info.user_state(self.address)
         except Exception as e:
             self.logger.error(f"Error getting user state: {e}")
             return {}
     
+    async def get_next_nonce(self) -> int:
+        """
+        Get next nonce for agent wallet transactions
+        Implements proper nonce management for agent wallets
+        """
+        if not self.exchange:
+            return 0
+            
+        try:
+            # If exchange provides nonce management, use it
+            if hasattr(self.exchange, 'get_next_nonce'):
+                return await self.exchange.get_next_nonce()
+            
+            # Otherwise, implement basic nonce management
+            self.nonce_increment += 1
+            return self.last_used_nonce + self.nonce_increment
+        except Exception as e:
+            self.logger.error(f"Error getting next nonce: {e}")
+            # Fallback to timestamp-based nonce
+            import time
+            return int(time.time() * 1000)
+    
     async def place_order(self, coin: str, is_buy: bool, size: float, price: float, 
                         reduce_only: bool = False, post_only: bool = False) -> Dict:
         """
-        Base method to place orders
+        Base method to place orders using agent wallet
         """
         if not self.exchange or not self.info:
             return {"status": "error", "message": "Exchange not initialized"}
             
         try:
-            # Implementation will be in derived classes
-            return {"status": "not_implemented"}
+            # Create order parameters
+            order_type = {"limit": {"tif": "Gtc"}}
+            if reduce_only:
+                order_type["limit"]["reduceOnly"] = True
+            if post_only:
+                order_type["limit"]["postOnly"] = True
+            
+            # Place order through exchange (which should use agent wallet)
+            result = self.exchange.order(coin, is_buy, size, price, order_type)
+            
+            # Update nonce if successful
+            if result.get("status") == "ok":
+                response = result.get("response", {})
+                if "nonce" in response:
+                    self.last_used_nonce = response["nonce"]
+            
+            return result
         except Exception as e:
             self.logger.error(f"Error placing order: {e}")
             return {"status": "error", "message": str(e)}
     
-    # Additional common methods can be added here
+    async def cancel_all_orders(self, coin: str) -> Dict:
+        """Cancel all orders for a specific coin"""
+        if not self.exchange or not self.info:
+            return {"status": "error", "message": "Exchange not initialized"}
+            
+        try:
+            return self.exchange.cancel_by_coin(coin)
+        except Exception as e:
+            self.logger.error(f"Error cancelling orders: {e}")
+            return {"status": "error", "message": str(e)}
+    
+    async def validate_agent_permissions(self) -> bool:
+        """
+        Validate that agent wallet has proper permissions
+        Returns True if agent has trading permissions
+        """
+        if not self.exchange or not self.address or not self.agent_wallet:
+            return False
+            
+        try:
+            # Try to place a small test order to verify permissions
+            test_result = await self.place_order("BTC", True, 0.0001, 1, reduce_only=True)
+            
+            # Check if order failed due to permissions
+            if test_result.get("status") == "error":
+                error_msg = str(test_result.get("message", "")).lower()
+                if "permission" in error_msg or "unauthorized" in error_msg:
+                    self.logger.warning("Agent wallet permission validation failed")
+                    return False
+                    
+                # Might have failed for other reasons (e.g. insufficient funds, price too far)
+                # We'll consider this valid as permissions seem to be in place
+                return True
+                
+            # If order succeeded, cancel it
+            if "orderId" in test_result:
+                await self.cancel_all_orders("BTC")
+                
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error validating agent permissions: {e}")
+            return False
 
 class ProfitOptimizedTrader(BaseTrader):
     """

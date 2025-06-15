@@ -25,6 +25,9 @@ import basic_vault_transfer
 import basic_transfer
 import example_utils
 
+# Configure module-level logger
+logger = logging.getLogger(__name__)
+
 @dataclass
 class VaultUser:
     """Vault user data"""
@@ -61,13 +64,19 @@ class VaultManager:
     
     def __init__(self, vault_address=None, base_url=None, exchange=None, info=None):
         self.vault_address = vault_address
-        self.base_url = base_url
+        self.base_url = base_url or constants.MAINNET_API_URL
         self.exchange = exchange
         self.info = info
         self.initialized = False
         
+        # For tracking operation status
+        self.last_error = None
+        self.last_error_time = None
+        self.error_count = 0
+        self.consecutive_errors = 0
+        
         # Validate whether this vault manager can operate
-        self.operational = bool(self.vault_address and self.exchange and self.info)
+        self.operational = self.validate_vault_address() and bool(self.exchange and self.info)
         
         if not self.vault_address:
             logger.warning("No vault address provided - vault manager will operate in limited mode")
@@ -77,6 +86,10 @@ class VaultManager:
     
     def check_health(self) -> bool:
         """Check if vault manager is operational"""
+        # Check both initialization status and consecutive errors
+        if self.consecutive_errors > 5:
+            logger.warning(f"Vault manager health check failed: {self.consecutive_errors} consecutive errors")
+            return False
         return self.operational and self.initialized
     
     def validate_vault_address(self) -> bool:
@@ -89,13 +102,22 @@ class VaultManager:
             return False
             
         # Check if the address is properly formatted (starts with 0x and 42 chars)
-        if not self.vault_address.startswith('0x') or len(self.vault_address) != 42:
+        if not isinstance(self.vault_address, str):
+            logger.warning(f"Vault address must be a string, got {type(self.vault_address)}")
+            return False
+            
+        # Normalize address format
+        address = self.vault_address.strip().lower()
+        
+        # Check proper Ethereum address format
+        if not address.startswith('0x') or len(address) != 42:
             logger.warning(f"Invalid vault address format: {self.vault_address}")
             return False
             
-        # Ensure it's a string to avoid serialization issues
-        if not isinstance(self.vault_address, str):
-            logger.warning(f"Vault address must be a string, got {type(self.vault_address)}")
+        # Check if address contains only valid hex characters after 0x
+        hex_part = address[2:]
+        if not all(c in '0123456789abcdef' for c in hex_part):
+            logger.warning(f"Vault address contains invalid characters: {self.vault_address}")
             return False
             
         return True
@@ -108,23 +130,47 @@ class VaultManager:
         if not self.vault_address:
             return ""
             
+        # Normalize address
+        address = self.vault_address.strip().lower()
+        
         # Ensure address starts with 0x prefix
-        address = self.vault_address
         if not address.startswith('0x'):
             address = f'0x{address}'
             
         return address
+    
+    def _record_error(self, error: Exception) -> None:
+        """Record an error for health monitoring"""
+        current_time = time.time()
+        self.last_error = str(error)
+        self.last_error_time = current_time
+        self.error_count += 1
+        self.consecutive_errors += 1
+        
+        error_level = logging.ERROR
+        # If we have multiple consecutive errors, escalate to warning
+        if self.consecutive_errors > 3:
+            error_level = logging.WARNING
+            
+        logger.log(error_level, f"Vault manager error: {error} (consecutive: {self.consecutive_errors})")
+    
+    def _record_success(self) -> None:
+        """Record a successful operation for health monitoring"""
+        self.consecutive_errors = 0  # Reset consecutive errors counter
 
     async def initialize(self):
         """Initialize the vault manager with validation"""
-        if not self.operational:
-            logger.warning("Cannot initialize vault manager: missing required components")
+        # Skip initialization if not operational
+        if not self.validate_vault_address():
+            logger.warning("Cannot initialize vault manager: invalid vault address")
+            self.operational = False
             self.initialized = False
             return False
             
-        # Validate vault address
-        if not self.validate_vault_address():
-            logger.error("Invalid vault address - cannot initialize")
+        # Skip if no exchange or info client
+        if not self.exchange or not self.info:
+            logger.warning("Cannot initialize vault manager: missing exchange or info client")
+            self.operational = False
             self.initialized = False
             return False
             
@@ -132,39 +178,44 @@ class VaultManager:
             # Test connection to vault
             formatted_address = self.ensure_vault_address_format()
             state = self.info.user_state(formatted_address)
-            if state and "marginSummary" in state:
+            
+            if state and isinstance(state, dict) and "marginSummary" in state:
                 self.initialized = True
+                self._record_success()  # Record successful initialization
                 logger.info(f"Vault manager initialized for {formatted_address}")
                 return True
             else:
-                logger.error(f"Failed to fetch vault state for {formatted_address}")
+                logger.error(f"Failed to fetch valid vault state for {formatted_address}")
+                self._record_error(Exception("Invalid vault state response"))
                 self.initialized = False
                 return False
+                
         except Exception as e:
             logger.error(f"Error initializing vault manager: {e}")
+            self._record_error(e)
             self.initialized = False
             return False
     
     async def get_vault_balance(self) -> Dict:
         """Get real vault balance using Info API exactly like basic_vault.py"""
-        # Return graceful response if vault is not operational
-        if not self.operational or not self.initialized:
+        # Return graceful response if vault address is not valid
+        if not self.validate_vault_address():
             return {
                 "status": "not_configured",
                 "total_value": 0.0,
-                "message": "Vault not configured (missing address or API clients)",
+                "message": "Vault not configured (missing or invalid address)",
                 "position_count": 0,
                 "positions": [],
                 "total_margin_used": 0.0,
                 "total_unrealized_pnl": 0.0
             }
             
-        # Validate vault address
-        if not self.validate_vault_address():
+        # Return graceful response if other required components are missing
+        if not self.operational or not self.initialized:
             return {
-                "status": "error",
-                "message": "Invalid vault address",
+                "status": "not_operational",
                 "total_value": 0.0,
+                "message": "Vault manager not operational or not initialized",
                 "position_count": 0,
                 "positions": [],
                 "total_margin_used": 0.0,
@@ -178,11 +229,33 @@ class VaultManager:
             # Fetch vault account data
             vault_state = self.info.user_state(formatted_address)
             
+            # Validate response format
+            if not isinstance(vault_state, dict) or "marginSummary" not in vault_state:
+                logger.warning(f"Invalid vault state response for {formatted_address}")
+                self._record_error(Exception("Invalid vault state response format"))
+                return {
+                    "status": "error",
+                    "message": "Invalid response from API",
+                    "total_value": 0.0,
+                    "position_count": 0,
+                    "positions": [],
+                    "total_margin_used": 0.0,
+                    "total_unrealized_pnl": 0.0
+                }
+            
             # Extract account value and other key metrics
             margin_summary = vault_state.get("marginSummary", {})
-            account_value = float(margin_summary.get("accountValue", 0))
-            total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
-            total_unrealized_pnl = float(margin_summary.get("totalUnrealizedPnl", 0))
+            
+            # Safely convert values to float with fallback to 0
+            try:
+                account_value = float(margin_summary.get("accountValue", 0))
+                total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
+                total_unrealized_pnl = float(margin_summary.get("totalUnrealizedPnl", 0))
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Error parsing margin values: {e}")
+                account_value = 0.0
+                total_margin_used = 0.0
+                total_unrealized_pnl = 0.0
             
             # Get positions
             positions = []
@@ -193,9 +266,16 @@ class VaultManager:
                 position = asset_position.get("position", {})
                 if position:
                     coin = position.get("coin", "Unknown")
-                    size = float(position.get("szi", 0))
-                    entry_price = float(position.get("entryPx", 0))
-                    unrealized_pnl = float(position.get("unrealizedPnl", 0))
+                    
+                    # Safely convert values with error handling
+                    try:
+                        size = float(position.get("szi", 0))
+                        entry_price = float(position.get("entryPx", 0))
+                        unrealized_pnl = float(position.get("unrealizedPnl", 0))
+                    except (ValueError, TypeError):
+                        # Skip positions with invalid numeric data
+                        logger.warning(f"Skipping position with invalid numeric data: {coin}")
+                        continue
                     
                     if abs(size) > 1e-10:  # Only include non-zero positions
                         positions.append({
@@ -205,6 +285,9 @@ class VaultManager:
                             "unrealized_pnl": unrealized_pnl,
                             "notional_value": abs(size) * entry_price
                         })
+            
+            # Record successful operation
+            self._record_success()
             
             return {
                 "status": "success",
@@ -217,6 +300,7 @@ class VaultManager:
             
         except Exception as e:
             logger.error(f"Error getting vault balance: {e}")
+            self._record_error(e)
             return {
                 "status": "error",
                 "message": str(e),
@@ -231,18 +315,24 @@ class VaultManager:
         """
         Deposit to vault using basic_vault_transfer.py pattern exactly
         """
-        # Skip if vault not configured or initialized
-        if not self.operational or not self.initialized:
-            return {
-                'status': 'error',
-                'message': 'Vault not configured or initialized'
-            }
-            
-        # Validate vault address
+        # Skip if vault not configured, not initialized, or not operational
         if not self.validate_vault_address():
             return {
                 'status': 'error',
-                'message': 'Invalid vault address'
+                'message': 'Invalid or missing vault address'
+            }
+            
+        if not self.operational or not self.initialized:
+            return {
+                'status': 'error',
+                'message': 'Vault manager not operational or not initialized'
+            }
+            
+        # Validate amount
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            return {
+                'status': 'error',
+                'message': f'Invalid deposit amount: {amount}'
             }
             
         try:
@@ -257,7 +347,21 @@ class VaultManager:
                     }
 
             user_state = self.info.user_state(self.address)
-            account_value = float(user_state['marginSummary']['accountValue'])
+            
+            # Validate user state response
+            if not isinstance(user_state, dict) or 'marginSummary' not in user_state:
+                return {
+                    'status': 'error',
+                    'message': 'Invalid account state response'
+                }
+            
+            try:
+                account_value = float(user_state['marginSummary']['accountValue'])
+            except (KeyError, ValueError, TypeError):
+                return {
+                    'status': 'error',
+                    'message': 'Could not retrieve account value'
+                }
             
             if account_value < amount:
                 return {
@@ -276,6 +380,12 @@ class VaultManager:
                 formatted_address, True, amount_micro
             )
             
+            # Record successful operation if no error
+            if transfer_result.get('status') == 'ok':
+                self._record_success()
+            else:
+                self._record_error(Exception(f"Transfer failed: {transfer_result}"))
+            
             return {
                 'status': 'success' if transfer_result.get('status') == 'ok' else 'error',
                 'result': transfer_result,
@@ -285,24 +395,31 @@ class VaultManager:
             
         except Exception as e:
             logger.error(f"Error depositing to vault: {e}")
+            self._record_error(e)
             return {'status': 'error', 'message': str(e)}
 
     async def withdraw_from_vault(self, amount: float) -> Dict:
         """
         Withdraw from vault using basic_vault_transfer.py pattern exactly
         """
-        # Skip if vault not configured or initialized
-        if not self.operational or not self.initialized:
-            return {
-                'status': 'error',
-                'message': 'Vault not configured or initialized'
-            }
-            
-        # Validate vault address
+        # Skip if vault not properly configured
         if not self.validate_vault_address():
             return {
                 'status': 'error',
-                'message': 'Invalid vault address'
+                'message': 'Invalid or missing vault address'
+            }
+            
+        if not self.operational or not self.initialized:
+            return {
+                'status': 'error',
+                'message': 'Vault manager not operational or not initialized'
+            }
+            
+        # Validate amount
+        if not isinstance(amount, (int, float)) or amount <= 0:
+            return {
+                'status': 'error',
+                'message': f'Invalid withdrawal amount: {amount}'
             }
             
         try:
@@ -310,7 +427,7 @@ class VaultManager:
             formatted_address = self.ensure_vault_address_format()
             vault_balance = await self.get_vault_balance()
             
-            if vault_balance['status'] != 'success' or vault_balance['total_value'] < amount:
+            if vault_balance['status'] != 'success' or vault_balance.get('total_value', 0) < amount:
                 return {
                     'status': 'error',
                     'message': f"Insufficient vault balance. Available: ${vault_balance.get('total_value', 0):.2f}"
@@ -323,6 +440,12 @@ class VaultManager:
                 formatted_address, False, amount_micro
             )
             
+            # Record operation success/failure
+            if transfer_result.get('status') == 'ok':
+                self._record_success()
+            else:
+                self._record_error(Exception(f"Withdrawal failed: {transfer_result}"))
+            
             return {
                 'status': 'success' if transfer_result.get('status') == 'ok' else 'error',
                 'result': transfer_result,
@@ -332,6 +455,7 @@ class VaultManager:
             
         except Exception as e:
             logger.error(f"Error withdrawing from vault: {e}")
+            self._record_error(e)
             return {'status': 'error', 'message': str(e)}
 
     async def transfer_usd_to_user(self, user_address: str, amount: float) -> Dict:
@@ -1472,11 +1596,29 @@ class VaultManager:
             logger.error(f"Error updating performance metrics: {e}")
 
     async def _get_current_vault_value(self) -> float:
-        """Get current vault value"""
+        """Get current vault value with proper error handling"""
         try:
-            vault_state = self.info.user_state(self.vault_address)
-            return float(vault_state.get('marginSummary', {}).get('accountValue', 0))
-        except Exception:
+            # Skip if vault not properly configured
+            if not self.validate_vault_address():
+                return 0.0
+
+            # Format address correctly
+            formatted_address = self.ensure_vault_address_format()
+            vault_state = self.info.user_state(formatted_address)
+            
+            # Validate response format
+            if not isinstance(vault_state, dict) or 'marginSummary' not in vault_state:
+                logger.warning("Invalid vault state response format")
+                return 0.0
+                
+            # Safely convert to float
+            try:
+                return float(vault_state.get('marginSummary', {}).get('accountValue', 0))
+            except (ValueError, TypeError):
+                return 0.0
+                
+        except Exception as e:
+            logger.warning(f"Error getting vault value: {e}")
             return 0.0
 
     async def get_enhanced_performance_analytics(self) -> Dict:

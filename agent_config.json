@@ -4,5 +4,30 @@
   "agent_address": "0x26f350a547726742c141032832e942adc43226e0",
   "agent_key": "0x2bad49ecaea6c22d8e2c61574d75c19eef90fa3b3deb72b6747c7c8a310de9f2",
   "network": "mainnet",
-  "created_at": 1715455373
+  "created_at": 1715455373,
+  "comment": "Configuration for agent wallet management system",
+  "agent_management": {
+    "master_wallet_required": true,
+    "encryption_enabled": true,
+    "auto_approval_enabled": false,
+    "max_agents_per_user": 1
+  },
+  "security": {
+    "private_key_encryption": true,
+    "audit_logging": true,
+    "rate_limiting": true,
+    "compliance_checks": true
+  },
+  "database": {
+    "path": "agent_wallets.db",
+    "backup_enabled": true,
+    "encryption_key_source": "environment"
+  },
+  "trading": {
+    "default_strategies": ["grid", "market_making"],
+    "risk_limits": {
+      "max_position_size": 0.1,
+      "max_daily_volume": 1000
+    }
+  }
 }

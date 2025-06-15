@@ -1,4 +1,59 @@
 {
-  "secret_key": "0x02044a1da0832819c054536a42154931429d9abdfb924698b9a17e724a15b316",
-  "account_address": ""
+  "secret_key": "0x2bad49ecaea6c22d8e2c61574d75c19eef90fa3b3deb72b6747c7c8a310de9f2",
+  "account_address": "0x51662F7518c0AfcCEA0Ed9a702aCAAfE155795e3",
+  "hyperliquid": {
+    "api_url": "https://api.hyperliquid.xyz",
+    "mainnet": true,
+    "use_agent_for_core_operations": false
+  },
+  "telegram": {
+    "bot_token": "7918996154:AAGt5S3EvG1B-dC-8fiy-eJr-c5HiMyFoME",
+    "instructions": "Bot created! Username: @hyperliqubot - Keep this token secure!",
+    "allowed_users": []
+  },
+  "base_url": "https://api.hyperliquid.xyz",
+  "referral_code": "HYPERBOT",
+  "hyperevm": {
+    "network": "mainnet",
+    "rpc_url": "https://api.hyperliquid.xyz/evm"
+  },
+  "trading": {
+    "max_position_size": 10000,
+    "default_slippage": 0.005,
+    "risk_level": "medium"
+  },
+  "vault": {
+    "address": "",
+    "minimum_deposit": 50,
+    "profit_share": 0.1,
+    "lockup_days": 1,
+    "performance_fee": 0.1
+  },
+  "ai": {
+    "model_retrain_hours": 24,
+    "confidence_threshold": 0.7,
+    "max_signals_per_hour": 10
+  },
+  "auto_trading": {
+    "enabled_on_startup": false,
+    "market_monitoring": false,
+    "vault_tracking": false,
+    "profit_optimization": false,
+    "require_manual_start": true
+  },
+  "strategies": {
+    "grid_trading": {
+      "enabled": true,
+      "default_levels": 10,
+      "default_spacing": 0.002
+    },
+    "automated_trading": {
+      "enabled": true,
+      "momentum_threshold": 0.2
+    },
+    "profit_bot": {
+      "enabled": true,
+      "rebate_mining": true
+    }
+  }
 }
