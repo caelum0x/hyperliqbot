@@ -924,3 +924,68 @@ async def start_multi_asset_grid(self, coins: List[str], total_capital: float, b
     except Exception as e:
         self.logger.error(f"Error in multi-asset grid: {e}")
         return {"status": "error", "message": str(e)}
+
+    async def start_user_grid(self, user_id: int, exchange, config: Dict = None) -> Dict:
+        """
+        Start grid trading for a specific user (real implementation)
+        """
+        try:
+            if config is None:
+                config = {
+                    'pairs': ['BTC', 'ETH', 'SOL', 'AVAX', 'MATIC'],
+                    'grid_spacing': 0.005,  # 0.5%
+                    'num_levels': 6,
+                    'position_size': 10,  # $10 per level
+                }
+            from hyperliquid.info import Info
+            info = Info(exchange.base_url if hasattr(exchange, 'base_url') else constants.MAINNET_API_URL)
+            mids = info.all_mids()
+            if not mids:
+                return {'status': 'error', 'message': 'No market data available'}
+            orders_placed = 0
+            pairs_traded = []
+            for pair in config['pairs']:
+                if pair not in mids:
+                    continue
+                try:
+                    current_price = float(mids[pair])
+                    grid_spacing = config['grid_spacing']
+                    num_levels = config['num_levels']
+                    position_size = config['position_size']
+                    size_in_coins = position_size / current_price
+                    # Buy grid
+                    for i in range(1, num_levels // 2 + 1):
+                        buy_price = current_price * (1 - grid_spacing * i)
+                        result = exchange.order(
+                            pair, True, size_in_coins, buy_price,
+                            {"limit": {"tif": "Alo"}}
+                        )
+                        if result and result.get('status') == 'ok':
+                            orders_placed += 1
+                    # Sell grid
+                    for i in range(1, num_levels // 2 + 1):
+                        sell_price = current_price * (1 + grid_spacing * i)
+                        result = exchange.order(
+                            pair, False, size_in_coins, sell_price,
+                            {"limit": {"tif": "Alo"}}
+                        )
+                        if result and result.get('status') == 'ok':
+                            orders_placed += 1
+                    pairs_traded.append(pair)
+                except Exception as e:
+                    continue
+            self.user_grids = getattr(self, 'user_grids', {})
+            self.user_grids[user_id] = {
+                'config': config,
+                'pairs': pairs_traded,
+                'started_at': time.time(),
+                'orders_placed': orders_placed
+            }
+            return {
+                'status': 'success',
+                'orders_placed': orders_placed,
+                'pairs_count': len(pairs_traded),
+                'pairs': pairs_traded
+            }
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}

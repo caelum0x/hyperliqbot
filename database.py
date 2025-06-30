@@ -2,912 +2,498 @@
 SQLite database module for tracking users and profits
 Production-ready database with proper schema and indexing
 """
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple, Union
-from decimal import Decimal
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import base64
-import json
-import os
-import aiosqlite
-import logging
+import sqlite3
 import asyncio
+import aiosqlite
+import json
+import time
+import logging
+from typing import Dict, List, Optional, Any
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
-class Database:
-    def __init__(self, db_file: str = "bot_data.db"):
-        self.db_file = db_file
+class DatabaseManager:
+    def __init__(self, db_path: str = "hyperliquid_bot.db"):
+        self.db_path = db_path
         self.conn = None
-        self._connection_lock = asyncio.Lock()
-        self.encryption_key = None
-        
-        # Ensure db directory exists
-        os.makedirs(os.path.dirname(os.path.abspath(db_file)), exist_ok=True)
-        
-        # Version tracking for schema migrations
-        self.current_version = "0.2.0"
-        
-    def _generate_encryption_key(self) -> bytes:
-        """Generate encryption key from environment or create a new one"""
-        env_key = os.environ.get("BOT_ENCRYPTION_KEY")
-        if env_key:
-            # Use environment variable if available
-            try:
-                return base64.urlsafe_b64decode(env_key)
-            except Exception as e:
-                logger.error(f"Invalid encryption key format in environment: {e}")
-        
-        # Create a salt and derive a key
-        salt = os.urandom(16)
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=100000,
-        )
-        
-        # Use a default passphrase if not provided
-        passphrase = os.urandom(16)  # Random passphrase
-        key = base64.urlsafe_b64encode(kdf.derive(passphrase))
-        
-        # Save the key for future use
-        key_file = "encryption_key.bin"
-        with open(key_file, "wb") as f:
-            f.write(key)
-        
-        logger.info(f"Generated new encryption key and saved to {key_file}")
-        return key
+        self._initialized = False
     
-    async def _init_database(self):
-        """Initialize the database schema"""
-        async with self._connection_lock:
-            if self.conn is None:
-                import aiosqlite
-                self.conn = await aiosqlite.connect(self.db_file)
-                self.conn.row_factory = aiosqlite.Row
+    async def initialize(self) -> bool:
+        """MISSING METHOD - Initialize database connection and create tables"""
+        try:
+            self.conn = await aiosqlite.connect(self.db_path)
+            await self.conn.execute("PRAGMA foreign_keys = ON")
+            await self._create_tables()
+            self._initialized = True
+            logger.info(f"✅ Database initialized: {self.db_path}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Database initialization failed: {e}")
+            return False
+    
+    async def execute(self, query: str, params: tuple = ()) -> Optional[aiosqlite.Cursor]:
+        """MISSING METHOD - Execute SQL query with parameters"""
+        try:
+            if not self.conn:
+                await self.initialize()
             
-            # Generate encryption key if not already available
-            if self.encryption_key is None:
-                self.encryption_key = self._generate_encryption_key()
-            
-            # Create tables
-            async with self.conn.cursor() as cursor:
-                # Schema version tracking
-                await cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS schema_version (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        version TEXT NOT NULL,
-                        applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        description TEXT
-                    )
-                ''')
-                
-                # Users table with agent wallet columns
-                await cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS users (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        telegram_id INTEGER UNIQUE NOT NULL,
-                        telegram_username TEXT,
-                        hyperliquid_main_address TEXT,
-                        agent_wallet_address TEXT,
-                        agent_private_key TEXT,
-                        status TEXT DEFAULT 'unregistered',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        wallet_balance REAL DEFAULT 0.0,
-                        referrer_id INTEGER
-                    )
-                ''')
-                
-                # Approvals for tracking agent wallet approvals
-                await cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS approvals (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER NOT NULL,
-                        approval_type TEXT NOT NULL,
-                        status TEXT DEFAULT 'pending',
-                        metadata TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        processed_at TIMESTAMP,
-                        processed_by INTEGER,
-                        FOREIGN KEY (user_id) REFERENCES users(id),
-                        FOREIGN KEY (processed_by) REFERENCES users(id)
-                    )
-                ''')
-                
-                # Wallet operations for tracking deposits, withdrawals, etc.
-                await cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS wallet_operations (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER NOT NULL,
-                        operation_type TEXT NOT NULL,
-                        amount REAL,
-                        status TEXT DEFAULT 'pending',
-                        tx_hash TEXT,
-                        metadata TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        completed_at TIMESTAMP,
-                        FOREIGN KEY (user_id) REFERENCES users(id)
-                    )
-                ''')
-                
-                # User strategies
-                await cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS user_strategies (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER NOT NULL,
-                        strategy_name TEXT NOT NULL,
-                        status TEXT DEFAULT 'inactive',
-                        config TEXT,
-                        performance TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_run TIMESTAMP,
-                        FOREIGN KEY (user_id) REFERENCES users(id),
-                        UNIQUE(user_id, strategy_name)
-                    )
-                ''')
-                
-                # User trades
-                await cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS user_trades (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER NOT NULL,
-                        strategy_id INTEGER,
-                        coin TEXT NOT NULL,
-                        side TEXT NOT NULL,
-                        size REAL NOT NULL,
-                        price REAL NOT NULL,
-                        pnl REAL,
-                        fee REAL,
-                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        tx_hash TEXT,
-                        metadata TEXT,
-                        FOREIGN KEY (user_id) REFERENCES users(id),
-                        FOREIGN KEY (strategy_id) REFERENCES user_strategies(id)
-                    )
-                ''')
-                
-                # Check for existing schema version
-                await cursor.execute("SELECT COUNT(*) FROM schema_version")
-                has_version = await cursor.fetchone()
-                if not has_version or has_version[0] == 0:
-                    # Insert initial version
-                    await cursor.execute(
-                        "INSERT INTO schema_version (version, description) VALUES (?, ?)",
-                        (self.current_version, f"Initial schema creation at {datetime.now().isoformat()}")
-                    )
-                
-                # Add indexes for performance
-                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id)")
-                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_agent_wallet ON users(agent_wallet_address)")
-                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_user_id ON approvals(user_id)")
-                await cursor.execute("CREATE INDEX IF NOT EXISTS idx_wallet_operations_user_id ON wallet_operations(user_id)")
-                
+            cursor = await self.conn.execute(query, params)
             await self.conn.commit()
-            
-            # Check for necessary columns in users table
-            await self._ensure_columns_exist()
-    
-    async def _ensure_columns_exist(self):
-        """Ensure all required columns exist in the users table"""
-        async with self.conn.cursor() as cursor:
-            # Check columns in users table
-            await cursor.execute("PRAGMA table_info(users)")
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            # Add missing columns
-            columns_to_check = {
-                "agent_wallet_address": "TEXT",
-                "agent_private_key": "TEXT",
-                "wallet_balance": "REAL DEFAULT 0.0"
-            }
-            
-            for column_name, column_type in columns_to_check.items():
-                if column_name not in column_names:
-                    try:
-                        await cursor.execute(f"ALTER TABLE users ADD COLUMN {column_name} {column_type}")
-                        logger.info(f"Added missing column {column_name} to users table")
-                    except Exception as e:
-                        logger.error(f"Error adding column {column_name}: {e}")
-            
-            await self.conn.commit()
-    
-    async def initialize(self):
-        """Initialize the database and perform any needed migrations"""
-        await self._init_database()
-        await self._check_migrations()
-    
-    async def _check_migrations(self):
-        """Check if any schema migrations are needed"""
-        async with self.conn.cursor() as cursor:
-            try:
-                # ✅ DATABASE FIX: Create schema_version table with proper structure
-                await cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS schema_version (
-                        version TEXT PRIMARY KEY,
-                        applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        description TEXT NOT NULL DEFAULT ''
-                    )
-                ''')
-                
-                # Check current version
-                await cursor.execute("SELECT version FROM schema_version ORDER BY applied_at DESC LIMIT 1")
-                result = await cursor.fetchone()
-                current_version = result[0] if result else "0.0.0"
-                
-                # Apply migrations if needed
-                if self._compare_versions(current_version, self.current_version) < 0:
-                    logger.info(f"Applying database migrations from {current_version} to {self.current_version}")
-                    
-                    # Apply version-specific migrations
-                    if self._compare_versions(current_version, "0.1.0") < 0:
-                        await self._migration_0_1_0()
-                        await cursor.execute(
-                            "INSERT OR REPLACE INTO schema_version (version, description) VALUES (?, ?)",
-                            ("0.1.0", "Initial schema with user tables")
-                        )
-                    
-                    if self._compare_versions(current_version, "0.2.0") < 0:
-                        await self._migration_0_2_0()
-                        await cursor.execute(
-                            "INSERT OR REPLACE INTO schema_version (version, description) VALUES (?, ?)",
-                            ("0.2.0", "Added agent wallet support and enhanced security")
-                        )
-                    
-                    # Update to current version
-                    await cursor.execute(
-                        "INSERT OR REPLACE INTO schema_version (version, description) VALUES (?, ?)",
-                        (self.current_version, "Current production version")
-                    )
-                    await self.conn.commit()
-                    
-                    logger.info(f"Database migrated to version {self.current_version}")
-                    
-            except Exception as e:
-                logger.error(f"Migration error: {e}")
-                # Don't raise - allow bot to continue with existing schema
-
-    async def _migration_0_1_0(self):
-        """Migration to version 0.1.0 - Initial schema"""
-        async with self.conn.cursor() as cursor:
-            # Add any schema changes for 0.1.0
-            await cursor.execute('''
-                CREATE TABLE IF NOT EXISTS migration_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    version TEXT NOT NULL,
-                    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    description TEXT
-                )
-            ''')
-        await self.conn.commit()
-    
-    async def _migration_0_2_0(self):
-        """Migration to version 0.2.0 - Agent wallet enhancements"""
-        async with self.conn.cursor() as cursor:
-            # Add security audit table
-            await cursor.execute('''
-                CREATE TABLE IF NOT EXISTS security_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_type TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    user_id INTEGER,
-                    description TEXT,
-                    details TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Add rate limiting table
-            await cursor.execute('''
-                CREATE TABLE IF NOT EXISTS rate_limits (
-                    user_id INTEGER NOT NULL,
-                    command TEXT NOT NULL,
-                    count INTEGER DEFAULT 1,
-                    window_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, command)
-                )
-            ''')
-            
-        await self.conn.commit()
-    
-    async def execute(self, query: str, parameters: tuple = ()) -> List[Dict]:
-        """Execute a query and return results as a list of dictionaries"""
-        if self.conn is None:
-            await self._init_database()
-            
-        async with self.conn.execute(query, parameters) as cursor:
-            columns = [column[0] for column in cursor.description] if cursor.description else []
-            result = await cursor.fetchall()
-            
-            # Convert rows to dictionaries
-            return [dict(zip(columns, row)) for row in result]
-    
-    def encrypt_private_key(self, private_key: str) -> str:
-        """Encrypt a private key using Fernet symmetric encryption"""
-        if not private_key:
-            return ""
-            
-        if not private_key.startswith("0x"):
-            private_key = f"0x{private_key}"
-            
-        if not self.encryption_key:
-            self.encryption_key = self._generate_encryption_key()
-            
-        f = Fernet(self.encryption_key)
-        encrypted_key = f.encrypt(private_key.encode())
-        return encrypted_key.decode()
-    
-    def decrypt_private_key(self, encrypted_key: str) -> str:
-        """Decrypt an encrypted private key"""
-        if not encrypted_key:
-            return ""
-            
-        if not self.encryption_key:
-            self.encryption_key = self._generate_encryption_key()
-            
-        f = Fernet(self.encryption_key)
-        decrypted_key = f.decrypt(encrypted_key.encode())
-        return decrypted_key.decode()
-    
-    async def add_user(self, telegram_id: int, telegram_username: str = None, 
-                       referrer_id: int = None) -> Dict:
-        """
-        Add a new user to the database
-        Returns the user record
-        """
-        if self.conn is None:
-            await self._init_database()
-            
-        # Check if user already exists
-        async with self.conn.cursor() as cursor:
-            await cursor.execute(
-                "SELECT id FROM users WHERE telegram_id = ?", 
-                (telegram_id,)
-            )
-            existing_user = await cursor.fetchone()
-            
-            if existing_user:
-                # User exists, just update last_active
-                await cursor.execute(
-                    "UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE telegram_id = ?",
-                    (telegram_id,)
-                )
-                await self.conn.commit()
-                
-                # Return user data
-                await cursor.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
-                user_data = await cursor.fetchone()
-                columns = [column[0] for column in cursor.description]
-                return dict(zip(columns, user_data))
-                
-            # Create new user
-            current_time = datetime.now().isoformat()
-            await cursor.execute(
-                """
-                INSERT INTO users (
-                    telegram_id, telegram_username, status, 
-                    created_at, last_active, referrer_id
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (telegram_id, telegram_username, "unregistered", 
-                 current_time, current_time, referrer_id)
-            )
-            await self.conn.commit()
-            
-            # Get user ID
-            await cursor.execute(
-                "SELECT * FROM users WHERE telegram_id = ?",
-                (telegram_id,)
-            )
-            user_data = await cursor.fetchone()
-            columns = [column[0] for column in cursor.description]
-            
-            return dict(zip(columns, user_data))
-    
-    async def add_agent_wallet(self, telegram_id: int, agent_address: str,
-                             main_address: str, private_key: str) -> Dict:
-        """
-        Add agent wallet to user
-        Encrypts the private key before storage
-        """
-        if self.conn is None:
-            await self._init_database()
-            
-        # Encrypt private key
-        encrypted_key = self.encrypt_private_key(private_key)
-        
-        async with self.conn.cursor() as cursor:
-            # Update user with agent wallet info
-            await cursor.execute(
-                """
-                UPDATE users SET
-                    hyperliquid_main_address = ?,
-                    agent_wallet_address = ?,
-                    agent_private_key = ?,
-                    status = ?,
-                    last_active = CURRENT_TIMESTAMP
-                WHERE telegram_id = ?
-                """,
-                (main_address, agent_address, encrypted_key, "pending_approval", telegram_id)
-            )
-            
-            # Create approval record
-            await cursor.execute(
-                """
-                INSERT INTO approvals (
-                    user_id, approval_type, status, metadata
-                ) VALUES (
-                    (SELECT id FROM users WHERE telegram_id = ?),
-                    'agent_wallet', 'pending', ?
-                )
-                """,
-                (telegram_id, json.dumps({
-                    "agent_address": agent_address,
-                    "main_address": main_address,
-                    "created_at": datetime.now().isoformat()
-                }))
-            )
-            
-            await self.conn.commit()
-            
-            # Return updated user data
-            await cursor.execute(
-                """
-                SELECT id, telegram_id, hyperliquid_main_address, 
-                       agent_wallet_address, status
-                FROM users WHERE telegram_id = ?
-                """, 
-                (telegram_id,)
-            )
-            user_data = await cursor.fetchone()
-            if user_data:
-                columns = [column[0] for column in cursor.description]
-                return dict(zip(columns, user_data))
-            return {}
-    
-    async def get_agent_wallet(self, telegram_id: int, agent_address: str = None) -> Optional[Dict]:
-        """
-        Get agent wallet details for a user
-        If agent_address is provided, it also validates the address matches
-        """
-        if self.conn is None:
-            await self._init_database()
-            
-        async with self.conn.cursor() as cursor:
-            query = """
-                SELECT id, telegram_id, hyperliquid_main_address,
-                       agent_wallet_address, agent_private_key, status,
-                       created_at, last_active, wallet_balance
-                FROM users
-                WHERE telegram_id = ?
-            """
-            params = [telegram_id]
-            
-            if agent_address:
-                query += " AND agent_wallet_address = ?"
-                params.append(agent_address)
-                
-            await cursor.execute(query, params)
-            result = await cursor.fetchone()
-            
-            if result:
-                columns = [column[0] for column in cursor.description]
-                wallet_data = dict(zip(columns, result))
-                
-                # Don't return the encrypted key directly
-                wallet_data["has_private_key"] = bool(wallet_data.get("agent_private_key"))
-                del wallet_data["agent_private_key"]
-                
-                return wallet_data
-                
+            return cursor
+        except Exception as e:
+            logger.error(f"Database execute error: {e}")
             return None
     
-    async def get_agent_private_key(self, telegram_id: int, agent_address: str, 
-                                  access_reason: str = "api_call",
-                                  access_ip: str = None) -> Optional[str]:
-        """
-        Get decrypted private key for a user's agent wallet
-        Logs access for security and limits access to verified requests
-        """
-        if self.conn is None:
-            await self._init_database()
-            
-        async with self.conn.cursor() as cursor:
-            # Get encrypted private key
-            await cursor.execute(
-                """
-                SELECT agent_private_key, status
-                FROM users
-                WHERE telegram_id = ? AND agent_wallet_address = ?
-                """,
-                (telegram_id, agent_address)
-            )
-            result = await cursor.fetchone()
-            
-            if not result or not result[0]:
-                return None
-                
-            encrypted_key, status = result
-            
-            # Only approved or trading status can access private keys
-            if status not in ("approved", "funded", "trading"):
-                logger.warning(f"Attempted key access for unapproved agent: {agent_address}")
-                return None
-                
-            # Log access
-            await cursor.execute(
-                """
-                INSERT INTO wallet_operations (
-                    user_id, operation_type, status, metadata
-                ) VALUES (
-                    (SELECT id FROM users WHERE telegram_id = ?),
-                    'key_access', 'completed', ?
-                )
-                """,
-                (
-                    telegram_id, 
-                    json.dumps({
-                        "reason": access_reason,
-                        "ip": access_ip,
-                        "timestamp": datetime.now().isoformat()
-                    })
-                )
-            )
-            await self.conn.commit()
-            
-            # Decrypt and return
-            return self.decrypt_private_key(encrypted_key)
+    async def fetchone(self, query: str, params: tuple = ()) -> Optional[tuple]:
+        """Fetch single row"""
+        try:
+            cursor = await self.execute(query, params)
+            if cursor:
+                return await cursor.fetchone()
+            return None
+        except Exception as e:
+            logger.error(f"Database fetchone error: {e}")
+            return None
     
-    async def update_agent_wallet_status(self, telegram_id: int, agent_address: str,
-                                       status: str, approved: bool = False) -> bool:
-        """Update agent wallet status"""
-        if self.conn is None:
-            await self._init_database()
-            
-        valid_statuses = ["pending_approval", "approved", "funded", "trading"]
-        if status not in valid_statuses:
+    async def fetchall(self, query: str, params: tuple = ()) -> List[tuple]:
+        """Fetch all rows"""
+        try:
+            cursor = await self.execute(query, params)
+            if cursor:
+                return await cursor.fetchall()
+            return []
+        except Exception as e:
+            logger.error(f"Database fetchall error: {e}")
+            return []
+    
+    async def health_check(self) -> bool:
+        """Health check method for main.py"""
+        try:
+            cursor = await self.execute("SELECT 1")
+            return cursor is not None
+        except:
             return False
-            
-        async with self.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                UPDATE users SET
-                    status = ?,
-                    last_active = CURRENT_TIMESTAMP
-                WHERE telegram_id = ? AND agent_wallet_address = ?
-                """,
-                (status, telegram_id, agent_address)
-            )
-            
-            if approved:
-                # Update approval status
-                await cursor.execute(
-                    """
-                    UPDATE approvals SET
-                        status = 'approved',
-                        processed_at = CURRENT_TIMESTAMP
-                    WHERE user_id = (SELECT id FROM users WHERE telegram_id = ?)
-                    AND approval_type = 'agent_wallet'
-                    AND status = 'pending'
-                    """,
-                    (telegram_id,)
-                )
-                
-            await self.conn.commit()
-            return True
     
-    async def enable_agent_wallet_trading(self, telegram_id: int, agent_address: str,
-                                        enable: bool = True) -> bool:
-        """Enable or disable trading for an agent wallet"""
-        if self.conn is None:
-            await self._init_database()
+    async def _create_tables(self):
+        """Create all necessary tables"""
+        tables = [
+            """CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE NOT NULL,
+                hyperliquid_address TEXT,
+                agent_wallet_address TEXT,
+                agent_private_key TEXT,
+                status TEXT DEFAULT 'unregistered',
+                config TEXT DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
             
-        status = "trading" if enable else "funded"
+            """CREATE TABLE IF NOT EXISTS user_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                strategy TEXT NOT NULL,
+                coin TEXT NOT NULL,
+                side TEXT NOT NULL,
+                size REAL NOT NULL,
+                price REAL NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                pnl REAL DEFAULT 0,
+                order_id TEXT,
+                status TEXT DEFAULT 'pending',
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )""",
+            
+            """CREATE TABLE IF NOT EXISTS trading_performance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                total_pnl REAL DEFAULT 0,
+                volume_usd REAL DEFAULT 0,
+                trades_count INTEGER DEFAULT 0,
+                win_rate REAL DEFAULT 0,
+                account_value REAL DEFAULT 0,
+                strategy TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )""",
+            
+            """CREATE TABLE IF NOT EXISTS hyperevm_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                activity_type TEXT NOT NULL,
+                protocol_name TEXT NOT NULL,
+                amount_usd REAL DEFAULT 0,
+                transaction_hash TEXT,
+                points_earned REAL DEFAULT 0,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'completed',
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )""",
+            
+            """CREATE TABLE IF NOT EXISTS vault_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                vault_address TEXT NOT NULL,
+                deposit_amount REAL NOT NULL,
+                deposit_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                withdrawal_amount REAL DEFAULT 0,
+                withdrawal_time TIMESTAMP,
+                current_balance REAL NOT NULL,
+                profit_share REAL DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )""",
+            
+            """CREATE TABLE IF NOT EXISTS referral_commissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER NOT NULL,
+                referee_id INTEGER NOT NULL,
+                commission_amount REAL NOT NULL,
+                volume_generated REAL NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'pending',
+                FOREIGN KEY (referrer_id) REFERENCES users (id),
+                FOREIGN KEY (referee_id) REFERENCES users (id)
+            )"""
+        ]
         
-        async with self.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                UPDATE users SET
-                    status = ?,
-                    last_active = CURRENT_TIMESTAMP
-                WHERE telegram_id = ? AND agent_wallet_address = ?
-                AND status IN ('funded', 'trading')
-                """,
-                (status, telegram_id, agent_address)
-            )
-            
-            changed = cursor.rowcount > 0
-            await self.conn.commit()
-            return changed
+        for table_sql in tables:
+            await self.execute(table_sql)
     
-    async def update_wallet_balance(self, telegram_id: int, balance: float) -> bool:
-        """Update user's wallet balance"""
-        if self.conn is None:
-            await self._init_database()
-            
-        async with self.conn.cursor() as cursor:
-            await cursor.execute(
-                """
-                UPDATE users SET
-                    wallet_balance = ?,
-                    last_active = CURRENT_TIMESTAMP
-                WHERE telegram_id = ?
-                """,
-                (balance, telegram_id)
+    # USER MANAGEMENT METHODS
+    async def create_user(self, telegram_id: int, hyperliquid_address: str = None) -> Optional[int]:
+        """Create new user and return user ID"""
+        try:
+            cursor = await self.execute(
+                "INSERT INTO users (telegram_id, hyperliquid_address) VALUES (?, ?)",
+                (telegram_id, hyperliquid_address)
             )
-            
-            changed = cursor.rowcount > 0
-            await self.conn.commit()
-            return changed
-            
-    async def register_user_strategy(self, telegram_id: int, strategy_name: str, 
-                                   config: Dict) -> Dict:
-        """Register a strategy for a user"""
-        if self.conn is None:
-            await self._init_database()
-            
-        async with self.conn.cursor() as cursor:
-            # Get user ID
-            await cursor.execute(
-                "SELECT id FROM users WHERE telegram_id = ?",
+            return cursor.lastrowid if cursor else None
+        except Exception as e:
+            logger.error(f"Create user error: {e}")
+            return None
+    
+    async def get_user_by_telegram_id(self, telegram_id: int) -> Optional[Dict]:
+        """Get user by Telegram ID"""
+        try:
+            row = await self.fetchone(
+                "SELECT * FROM users WHERE telegram_id = ?", 
                 (telegram_id,)
             )
-            user = await cursor.fetchone()
-            
-            if not user:
-                return {"status": "error", "message": "User not found"}
-                
-            user_id = user[0]
-            
-            # Check if strategy already exists
-            await cursor.execute(
-                """
-                SELECT id FROM user_strategies 
-                WHERE user_id = ? AND strategy_name = ?
-                """,
-                (user_id, strategy_name)
+            if row:
+                return {
+                    'id': row[0],
+                    'telegram_id': row[1],
+                    'hyperliquid_address': row[2],
+                    'agent_wallet_address': row[3],
+                    'agent_private_key': row[4],
+                    'status': row[5],
+                    'config': json.loads(row[6]) if row[6] else {},
+                    'created_at': row[7],
+                    'last_active': row[8]
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Get user error: {e}")
+            return None
+    
+    async def update_user_status(self, user_id: int, status: str) -> bool:
+        """Update user status"""
+        try:
+            cursor = await self.execute(
+                "UPDATE users SET status = ?, last_active = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, user_id)
+            )
+            return cursor is not None
+        except Exception as e:
+            logger.error(f"Update user status error: {e}")
+            return False
+    
+    async def update_user_agent_wallet(self, user_id: int, agent_address: str, agent_private_key: str) -> bool:
+        """Update user's agent wallet info"""
+        try:
+            cursor = await self.execute(
+                "UPDATE users SET agent_wallet_address = ?, agent_private_key = ? WHERE id = ?",
+                (agent_address, agent_private_key, user_id)
+            )
+            return cursor is not None
+        except Exception as e:
+            logger.error(f"Update agent wallet error: {e}")
+            return False
+    
+    # TRADING METHODS
+    async def log_trade(self, user_id: int, strategy: str, coin: str, side: str, 
+                       size: float, price: float, order_id: str = None) -> bool:
+        """Log a trade to database"""
+        try:
+            cursor = await self.execute(
+                """INSERT INTO user_trades 
+                   (user_id, strategy, coin, side, size, price, order_id) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, strategy, coin, side, size, price, order_id)
+            )
+            return cursor is not None
+        except Exception as e:
+            logger.error(f"Log trade error: {e}")
+            return False
+    
+    async def get_user_trades(self, user_id: int, limit: int = 100) -> List[Dict]:
+        """Get user's recent trades"""
+        try:
+            rows = await self.fetchall(
+                """SELECT * FROM user_trades 
+                   WHERE user_id = ? 
+                   ORDER BY timestamp DESC 
+                   LIMIT ?""",
+                (user_id, limit)
             )
             
-            existing = await cursor.fetchone()
+            trades = []
+            for row in rows:
+                trades.append({
+                    'id': row[0],
+                    'strategy': row[2],
+                    'coin': row[3],
+                    'side': row[4],
+                    'size': row[5],
+                    'price': row[6],
+                    'timestamp': row[7],
+                    'pnl': row[8],
+                    'order_id': row[9],
+                    'status': row[10]
+                })
+            return trades
+        except Exception as e:
+            logger.error(f"Get user trades error: {e}")
+            return []
+    
+    async def update_trade_pnl(self, trade_id: int, pnl: float) -> bool:
+        """Update trade PnL"""
+        try:
+            cursor = await self.execute(
+                "UPDATE user_trades SET pnl = ? WHERE id = ?",
+                (pnl, trade_id)
+            )
+            return cursor is not None
+        except Exception as e:
+            logger.error(f"Update trade PnL error: {e}")
+            return False
+    
+    # HYPEREVM ACTIVITY TRACKING
+    async def log_hyperevm_activity(self, user_id: int, activity_type: str, 
+                                   protocol_name: str, amount_usd: float = 0,
+                                   transaction_hash: str = None, points_earned: float = 0) -> bool:
+        """Log HyperEVM activity for airdrop tracking"""
+        try:
+            cursor = await self.execute(
+                """INSERT INTO hyperevm_activity 
+                   (user_id, activity_type, protocol_name, amount_usd, transaction_hash, points_earned) 
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (user_id, activity_type, protocol_name, amount_usd, transaction_hash, points_earned)
+            )
+            return cursor is not None
+        except Exception as e:
+            logger.error(f"Log HyperEVM activity error: {e}")
+            return False
+    
+    async def get_user_hyperevm_stats(self, user_id: int) -> Dict:
+        """Get user's HyperEVM activity stats"""
+        try:
+            # Total transactions
+            total_tx = await self.fetchone(
+                "SELECT COUNT(*) FROM hyperevm_activity WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            # Total volume
+            total_volume = await self.fetchone(
+                "SELECT SUM(amount_usd) FROM hyperevm_activity WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            # Total points
+            total_points = await self.fetchone(
+                "SELECT SUM(points_earned) FROM hyperevm_activity WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            # Unique protocols
+            unique_protocols = await self.fetchone(
+                "SELECT COUNT(DISTINCT protocol_name) FROM hyperevm_activity WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            return {
+                'total_transactions': total_tx[0] if total_tx else 0,
+                'total_volume_usd': total_volume[0] if total_volume and total_volume[0] else 0,
+                'total_points': total_points[0] if total_points and total_points[0] else 0,
+                'unique_protocols': unique_protocols[0] if unique_protocols else 0
+            }
+        except Exception as e:
+            logger.error(f"Get HyperEVM stats error: {e}")
+            return {'total_transactions': 0, 'total_volume_usd': 0, 'total_points': 0, 'unique_protocols': 0}
+    
+    # PERFORMANCE TRACKING
+    async def update_daily_performance(self, user_id: int, date: str, total_pnl: float, 
+                                     volume_usd: float, trades_count: int, account_value: float,
+                                     strategy: str = None) -> bool:
+        """Update daily performance metrics"""
+        try:
+            # Check if record exists
+            existing = await self.fetchone(
+                "SELECT id FROM trading_performance WHERE user_id = ? AND date = ?",
+                (user_id, date)
+            )
             
             if existing:
-                # Update existing strategy
-                await cursor.execute(
-                    """
-                    UPDATE user_strategies SET
-                        config = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    """,
-                    (json.dumps(config), existing[0])
+                # Update existing record
+                cursor = await self.execute(
+                    """UPDATE trading_performance 
+                       SET total_pnl = ?, volume_usd = ?, trades_count = ?, account_value = ?, strategy = ?
+                       WHERE user_id = ? AND date = ?""",
+                    (total_pnl, volume_usd, trades_count, account_value, strategy, user_id, date)
                 )
-                strategy_id = existing[0]
             else:
-                # Create new strategy
-                await cursor.execute(
-                    """
-                    INSERT INTO user_strategies (
-                        user_id, strategy_name, config, status,
-                        performance, created_at, updated_at
-                    ) VALUES (?, ?, ?, 'paused', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """,
-                    (
-                        user_id, strategy_name, json.dumps(config),
-                        json.dumps({"total_pnl": 0, "win_rate": 0, "trades": 0})
-                    )
+                # Insert new record
+                cursor = await self.execute(
+                    """INSERT INTO trading_performance 
+                       (user_id, date, total_pnl, volume_usd, trades_count, account_value, strategy)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (user_id, date, total_pnl, volume_usd, trades_count, account_value, strategy)
                 )
-                strategy_id = cursor.lastrowid
-                
-            await self.conn.commit()
             
-            return {
-                "status": "success",
-                "strategy_id": strategy_id,
-                "message": "Strategy registered successfully"
-            }
+            return cursor is not None
+        except Exception as e:
+            logger.error(f"Update daily performance error: {e}")
+            return False
     
-    async def record_trade(self, telegram_id: int, strategy: str, trade_data: Dict) -> Dict:
-        """Record a trade for a user"""
-        if self.conn is None:
-            await self._init_database()
-            
-        required_fields = ["coin", "side", "size", "price", "timestamp"]
-        for field in required_fields:
-            if field not in trade_data:
-                return {"status": "error", "message": f"Missing required field: {field}"}
-                
-        async with self.conn.cursor() as cursor:
-            # Get user ID
-            await cursor.execute(
-                "SELECT id FROM users WHERE telegram_id = ?",
-                (telegram_id,)
-            )
-            user = await cursor.fetchone()
-            
-            if not user:
-                return {"status": "error", "message": "User not found"}
-                
-            user_id = user[0]
-            
-            # Record trade
-            await cursor.execute(
-                """
-                INSERT INTO user_trades (
-                    user_id, strategy, coin, side, size, price,
-                    timestamp, pnl, tx_hash, fee, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id, strategy,
-                    trade_data["coin"],
-                    trade_data["side"],
-                    trade_data["size"],
-                    trade_data["price"],
-                    trade_data["timestamp"],
-                    trade_data.get("pnl", 0),
-                    trade_data.get("tx_hash", ""),
-                    trade_data.get("fee", 0),
-                    json.dumps(trade_data.get("metadata", {}))
-                )
+    async def get_user_performance_summary(self, user_id: int, days: int = 30) -> Dict:
+        """Get user performance summary for last N days"""
+        try:
+            rows = await self.fetchall(
+                """SELECT date, total_pnl, volume_usd, trades_count, account_value 
+                   FROM trading_performance 
+                   WHERE user_id = ? 
+                   ORDER BY date DESC 
+                   LIMIT ?""",
+                (user_id, days)
             )
             
-            trade_id = cursor.lastrowid
-            await self.conn.commit()
+            if not rows:
+                return {'total_pnl': 0, 'total_volume': 0, 'total_trades': 0, 'current_value': 0, 'daily_data': []}
+            
+            total_pnl = sum(row[1] for row in rows if row[1])
+            total_volume = sum(row[2] for row in rows if row[2])
+            total_trades = sum(row[3] for row in rows if row[3])
+            current_value = rows[0][4] if rows[0][4] else 0
+            
+            daily_data = []
+            for row in rows:
+                daily_data.append({
+                    'date': row[0],
+                    'pnl': row[1] or 0,
+                    'volume': row[2] or 0,
+                    'trades': row[3] or 0,
+                    'account_value': row[4] or 0
+                })
             
             return {
-                "status": "success",
-                "trade_id": trade_id,
-                "message": "Trade recorded successfully"
+                'total_pnl': total_pnl,
+                'total_volume': total_volume,
+                'total_trades': total_trades,
+                'current_value': current_value,
+                'daily_data': daily_data
             }
+        except Exception as e:
+            logger.error(f"Get performance summary error: {e}")
+            return {'total_pnl': 0, 'total_volume': 0, 'total_trades': 0, 'current_value': 0, 'daily_data': []}
+    
+    # VAULT MANAGEMENT
+    async def add_vault_user(self, user_id: int, vault_address: str, deposit_amount: float) -> bool:
+        """Add user to vault"""
+        try:
+            cursor = await self.execute(
+                """INSERT INTO vault_users 
+                   (user_id, vault_address, deposit_amount, current_balance) 
+                   VALUES (?, ?, ?, ?)""",
+                (user_id, vault_address, deposit_amount, deposit_amount)
+            )
+            return cursor is not None
+        except Exception as e:
+            logger.error(f"Add vault user error: {e}")
+            return False
+    
+    async def get_vault_users(self, vault_address: str) -> List[Dict]:
+        """Get all users in a vault"""
+        try:
+            rows = await self.fetchall(
+                "SELECT * FROM vault_users WHERE vault_address = ? AND status = 'active'",
+                (vault_address,)
+            )
+            
+            users = []
+            for row in rows:
+                users.append({
+                    'user_id': row[1],
+                    'deposit_amount': row[3],
+                    'deposit_time': row[4],
+                    'current_balance': row[7],
+                    'profit_share': row[8]
+                })
+            return users
+        except Exception as e:
+            logger.error(f"Get vault users error: {e}")
+            return []
+    
+    # REFERRAL SYSTEM
+    async def log_referral_commission(self, referrer_id: int, referee_id: int, 
+                                    commission_amount: float, volume_generated: float) -> bool:
+        """Log referral commission"""
+        try:
+            cursor = await self.execute(
+                """INSERT INTO referral_commissions 
+                   (referrer_id, referee_id, commission_amount, volume_generated) 
+                   VALUES (?, ?, ?, ?)""",
+                (referrer_id, referee_id, commission_amount, volume_generated)
+            )
+            return cursor is not None
+        except Exception as e:
+            logger.error(f"Log referral commission error: {e}")
+            return False
+    
+    async def get_user_referral_stats(self, user_id: int) -> Dict:
+        """Get user's referral statistics"""
+        try:
+            total_commission = await self.fetchone(
+                "SELECT SUM(commission_amount) FROM referral_commissions WHERE referrer_id = ?",
+                (user_id,)
+            )
+            
+            total_volume = await self.fetchone(
+                "SELECT SUM(volume_generated) FROM referral_commissions WHERE referrer_id = ?",
+                (user_id,)
+            )
+            
+            referee_count = await self.fetchone(
+                "SELECT COUNT(DISTINCT referee_id) FROM referral_commissions WHERE referrer_id = ?",
+                (user_id,)
+            )
+            
+            return {
+                'total_commission': total_commission[0] if total_commission and total_commission[0] else 0,
+                'total_volume': total_volume[0] if total_volume and total_volume[0] else 0,
+                'referee_count': referee_count[0] if referee_count else 0
+            }
+        except Exception as e:
+            logger.error(f"Get referral stats error: {e}")
+            return {'total_commission': 0, 'total_volume': 0, 'referee_count': 0}
     
     async def close(self):
         """Close database connection"""
         if self.conn:
             await self.conn.close()
-            self.conn = None
+            logger.info("Database connection closed")
 
-# Singleton instance
-bot_db = Database()
-
-# Utility functions for backward compatibility
-async def get_user_stats(telegram_id: int) -> Optional[Dict]:
-    """Get user statistics (for backward compatibility)"""
-    if not bot_db.conn:
-        await bot_db.initialize()
-        
-    async with bot_db.conn.cursor() as cursor:
-        await cursor.execute(
-            """
-            SELECT u.*, 
-                   COUNT(ut.id) as total_trades,
-                   SUM(CASE WHEN ut.pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
-                   SUM(CASE WHEN ut.pnl < 0 THEN 1 ELSE 0 END) as losing_trades,
-                   SUM(ut.pnl) as total_pnl
-            FROM users u
-            LEFT JOIN user_trades ut ON u.id = ut.user_id
-            WHERE u.telegram_id = ?
-            GROUP BY u.id
-            """,
-            (telegram_id,)
-        )
-        
-        result = await cursor.fetchone()
-        
-        if result:
-            columns = [column[0] for column in cursor.description]
-            return dict(zip(columns, result))
-            
-        return None
-
-async def record_user_deposit(telegram_id: int, amount: float, tx_hash: str = None) -> Dict:
-    """Record a user deposit (for backward compatibility)"""
-    if not bot_db.conn:
-        await bot_db.initialize()
-        
-    async with bot_db.conn.cursor() as cursor:
-        # Get user ID
-        await cursor.execute(
-            "SELECT id FROM users WHERE telegram_id = ?",
-            (telegram_id,)
-        )
-        user = await cursor.fetchone()
-        
-        if not user:
-            return {"status": "error", "message": "User not found"}
-            
-        user_id = user[0]
-        
-        # Record deposit
-        await cursor.execute(
-            """
-            INSERT INTO wallet_operations (
-                user_id, operation_type, amount, status, tx_hash
-            ) VALUES (?, 'deposit', ?, 'confirmed', ?)
-            """,
-            (user_id, amount, tx_hash)
-        )
-        
-        # Update user status to funded if appropriate
-        await cursor.execute(
-            """
-            UPDATE users SET
-                status = CASE 
-                    WHEN status IN ('approved', 'pending_approval') THEN 'funded'
-                    ELSE status
-                END,
-                wallet_balance = wallet_balance + ?,
-                last_active = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (amount, user_id)
-        )
-        
-        await bot_db.conn.commit()
-        
-        return {
-            "status": "success",
-            "message": "Deposit recorded successfully",
-            "amount": amount
-        }
-
-async def get_vault_performance() -> Dict:
-    """Get vault performance metrics (for backward compatibility)"""
-    # Legacy function - implement if needed
-    return {
-        "tvl": 0,
-        "daily_return": 0,
-        "weekly_return": 0,
-        "monthly_return": 0,
-        "total_return": 0
-    }
-
-# Testing
-async def test_database():
-    """Test database functionality"""
-    db = Database(":memory:")
-    await db.initialize()
-    
-    # Test user creation
-    user = await db.add_user(12345, "testuser")
-    assert user["telegram_id"] == 12345
-    
-    # Test agent wallet
-    wallet = await db.add_agent_wallet(
-        12345,
-        "0x1234567890123456789012345678901234567890",
-        "0x0987654321098765432109876543210987654321",
-        "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
-    )
-    assert wallet["agent_wallet_address"] == "0x1234567890123456789012345678901234567890"
-    
-    # Test getting wallet
-    get_wallet = await db.get_agent_wallet(12345)
-    assert get_wallet["agent_wallet_address"] == "0x1234567890123456789012345678901234567890"
-    
-    # Test strategy registration
-    strategy = await db.register_user_strategy(12345, "grid", {"param1": "value1"})
-    assert strategy["status"] == "success"
-    
-    # Test trade recording
-    trade = await db.record_trade(
-        12345,
-        "grid",
-        {
-            "coin": "BTC",
-            "side": "buy",
-            "size": 0.1,
-            "price": 50000,
-            "timestamp": datetime.now().isoformat()
-        }
-    )
-    assert trade["status"] == "success"
-    
-    print("All database tests passed!")
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(test_database())
+# Create global database instance
+database = DatabaseManager()

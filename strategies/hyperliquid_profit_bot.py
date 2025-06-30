@@ -242,6 +242,93 @@ class HyperliquidProfitBot:
         else:
             return 0.0001   # 0.01% maker fee (no rebate)
 
+    async def start_profit_optimization(self, user_id: int, exchange, config: Dict = None) -> Dict:
+        """Start profit optimization for a specific user"""
+        try:
+            if config is None:
+                config = {
+                    'focus': 'maker_rebates',
+                    'pairs': ['BTC', 'ETH', 'SOL', 'AVAX', 'MATIC', 'LINK'],
+                    'rebate_target': 'tier_1',
+                    'position_size': 12
+                }
+            from hyperliquid.info import Info
+            info = Info(exchange.base_url if hasattr(exchange, 'base_url') else None)
+            mids = info.all_mids() if info else {}
+            if not mids:
+                return {'status': 'error', 'message': 'No market data available'}
+            orders_placed = 0
+            optimizations_started = []
+            # Rebate optimization
+            for pair in config['pairs'][:4]:
+                if pair not in mids:
+                    continue
+                try:
+                    current_price = float(mids[pair])
+                    size = config['position_size'] / current_price
+                    tight_spread = 0.001
+                    bid_price = current_price * (1 - tight_spread)
+                    ask_price = current_price * (1 + tight_spread)
+                    for level in range(2):
+                        level_adj = level * 0.0005
+                        level_bid = bid_price * (1 - level_adj)
+                        bid_result = exchange.order(
+                            pair, True, size * 0.6, level_bid,
+                            {"limit": {"tif": "Alo"}}
+                        )
+                        if bid_result and bid_result.get('status') == 'ok':
+                            orders_placed += 1
+                        level_ask = ask_price * (1 + level_adj)
+                        ask_result = exchange.order(
+                            pair, False, size * 0.6, level_ask,
+                            {"limit": {"tif": "Alo"}}
+                        )
+                        if ask_result and ask_result.get('status') == 'ok':
+                            orders_placed += 1
+                    optimizations_started.append('rebate_optimization')
+                except Exception:
+                    continue
+            # Volume building
+            for pair in config['pairs']:
+                if pair not in mids:
+                    continue
+                try:
+                    current_price = float(mids[pair])
+                    size = (config['position_size'] * 0.7) / current_price
+                    medium_spread = 0.003
+                    bid_price = current_price * (1 - medium_spread)
+                    ask_price = current_price * (1 + medium_spread)
+                    bid_result = exchange.order(
+                        pair, True, size, bid_price,
+                        {"limit": {"tif": "Alo"}}
+                    )
+                    if bid_result and bid_result.get('status') == 'ok':
+                        orders_placed += 1
+                    ask_result = exchange.order(
+                        pair, False, size, ask_price,
+                        {"limit": {"tif": "Alo"}}
+                    )
+                    if ask_result and ask_result.get('status') == 'ok':
+                        orders_placed += 1
+                    optimizations_started.append('volume_building')
+                except Exception:
+                    continue
+            self.user_optimizations = getattr(self, 'user_optimizations', {})
+            self.user_optimizations[user_id] = {
+                'config': config,
+                'optimizations': optimizations_started,
+                'started_at': time.time(),
+                'orders_placed': orders_placed
+            }
+            return {
+                'status': 'success',
+                'orders_placed': orders_placed,
+                'optimizations': optimizations_started,
+                'target_tier': config['rebate_target']
+            }
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+
     # Add placeholder methods that are referenced in the strategy manager
     async def maker_rebate_strategy(self, coin: str, position_size: float = 0.1) -> Dict:
         """Placeholder for maker rebate strategy"""

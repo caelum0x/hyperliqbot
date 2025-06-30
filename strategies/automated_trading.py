@@ -1409,6 +1409,81 @@ class AutomatedTrading:
             self.logger.error(f"Risk management error: {e}")
             return {'status': 'error', 'message': str(e)}
 
+    async def start_user_automation(self, user_id: int, exchange, config: Dict = None) -> Dict:
+        """Start automated trading for a specific user"""
+        try:
+            if config is None:
+                config = {
+                    'strategy': 'momentum_with_maker',
+                    'pairs': ['BTC', 'ETH', 'SOL'],
+                    'position_size': 15,  # $15 per trade
+                    'spread_percentage': 0.002  # 0.2% spread
+                }
+            from hyperliquid.info import Info
+            info = Info(exchange.base_url if hasattr(exchange, 'base_url') else constants.MAINNET_API_URL)
+            mids = info.all_mids()
+            if not mids:
+                return {'status': 'error', 'message': 'No market data available'}
+            orders_placed = 0
+            strategies_started = []
+            # Momentum
+            for pair in config['pairs'][:2]:
+                if pair not in mids:
+                    continue
+                try:
+                    current_price = float(mids[pair])
+                    size = config['position_size'] / current_price
+                    breakout_price = current_price * 1.008
+                    result = exchange.order(
+                        pair, True, size, breakout_price,
+                        {"limit": {"tif": "Gtc"}}
+                    )
+                    if result and result.get('status') == 'ok':
+                        orders_placed += 1
+                        strategies_started.append('momentum')
+                except Exception:
+                    continue
+            # Maker rebate
+            spread = config['spread_percentage']
+            for pair in config['pairs'][:3]:
+                if pair not in mids:
+                    continue
+                try:
+                    current_price = float(mids[pair])
+                    size = config['position_size'] / current_price
+                    bid_price = current_price * (1 - spread)
+                    ask_price = current_price * (1 + spread)
+                    bid_result = exchange.order(
+                        pair, True, size, bid_price,
+                        {"limit": {"tif": "Alo"}}
+                    )
+                    if bid_result and bid_result.get('status') == 'ok':
+                        orders_placed += 1
+                    ask_result = exchange.order(
+                        pair, False, size, ask_price,
+                        {"limit": {"tif": "Alo"}}
+                    )
+                    if ask_result and ask_result.get('status') == 'ok':
+                        orders_placed += 1
+                    strategies_started.append('maker_rebate')
+                except Exception:
+                    continue
+            self.user_strategies = getattr(self, 'user_strategies', {})
+            self.user_strategies[user_id] = {
+                'config': config,
+                'strategies': strategies_started,
+                'started_at': time.time(),
+                'orders_placed': orders_placed
+            }
+            return {
+                'status': 'success',
+                'orders_placed': orders_placed,
+                'strategies': strategies_started,
+                'pairs_count': len(config['pairs'])
+            }
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+
 # ...existing RealAutomatedTradingEngine code for compatibility...
 
 # Legacy class alias for compatibility

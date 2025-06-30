@@ -560,3 +560,29 @@ class AgentFactory:
         # Save latest agent details
         self._save_agent_details()
         logger.info("AgentFactory closed")
+    
+    async def check_master_funding(self) -> Dict:
+        """Check master wallet funding - FIXED"""
+        try:
+            from hyperliquid.utils.signing import get_address_from_private_key
+            agent_address = get_address_from_private_key(self.master_private_key)
+            user_state = self.master_info.user_state(agent_address)
+            account_value = float(user_state.get("marginSummary", {}).get("accountValue", 0))
+            if account_value >= 1.0:
+                return {
+                    'status': 'sufficient',
+                    'balance': account_value,
+                    'message': f'Agent wallet funded: ${account_value:.2f}'
+                }
+            else:
+                return {
+                    'status': 'insufficient',
+                    'balance': account_value,
+                    'message': f'Agent wallet needs funding: ${account_value:.2f}'
+                }
+        except Exception as e:
+            return {
+                'status': 'error',
+                'balance': 0,
+                'message': str(e)
+            }

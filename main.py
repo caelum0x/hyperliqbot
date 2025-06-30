@@ -711,7 +711,10 @@ class HyperliquidAlphaBot:
                                 f"✅ **Main Account Balance**\n\n"
                                 f"Main account balance: ${balance:.2f}\n"
                                 f"Status: {'Sufficient' if balance >= 5 else 'Low'} for agent wallet creation\n\n"
-                                f"Main account address: `{main_account_address}`"
+                                f"Main account address: `{main_account_address}`\n\n"
+                                f"**Quick Commands Available:**\n"
+                                f"• `/quick_orders` - Place immediate tight orders\n"
+                                f"• `/quick_status` - Check trading activity"
                             ),
                             parse_mode='Markdown'
                         )
