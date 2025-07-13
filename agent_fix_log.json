@@ -1,8 +1,8 @@
 {
   "agent_address_fix": {
     "issue": "Bot was using incorrect agent address",
-    "old_agent": "0xb6fc35081be3be66df8a511486c632ab5a80b500",
-    "new_agent": "0x26f350a547726742c141032832E942aDc43226E0",
+    "old_agent": "",
+    "new_agent": "",
     "status": "fixed"
   }
 }
